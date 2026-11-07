@@ -125,7 +125,9 @@ an explicit unsupported error. Keychain remains macOS-only; Linux uses
 the private file vault, and its cache follows the XDG cache directory.
 Desktop opening uses `xdg-open`, while clipboard images can be read with
 Wayland's `wl-paste` or X11's `xclip`. The remote HTTP server remains
-portable; installing its LaunchAgent does not.
+portable; installing its LaunchAgent does not. Global input idle time
+and screen lock status remain unavailable, so the existing away guard
+falls back to inactivity inside Rush on Linux.
 
 Installed plugins must keep the sandbox contract: Linux support must
 never turn a missing macOS sandbox into unsandboxed execution. The

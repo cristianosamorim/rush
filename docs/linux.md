@@ -70,6 +70,8 @@ build on that distribution instead.
 - Apple's menu bar app, on-device speech recognition, Apple Intelligence
   and transparent APFS compression remain macOS features. Their native
   libraries are not linked into the Linux executable.
+- Away detection uses inactivity inside Rush on Linux. Global keyboard
+  and mouse idle time and the desktop's lock status are unavailable.
 - Installed third-party plugins remain unavailable where Rush cannot
   provide its macOS sandbox. They are never run without that sandbox.
   Bundled plugins remain available according to their own requirements.

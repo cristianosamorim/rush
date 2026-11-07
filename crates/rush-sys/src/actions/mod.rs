@@ -356,7 +356,7 @@ pub fn notify(title: &str, body: &str) {
 
 /// s as Go's %q writes it, which AppleScript reads as a string: double
 /// quotes, with backslash escapes.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn go_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
