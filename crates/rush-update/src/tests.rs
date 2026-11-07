@@ -49,7 +49,9 @@ fn serving(answer: Box<Answer>) -> (String, Arc<AtomicUsize>) {
     (url, asked)
 }
 
-const LATEST: &str = "/repos/0xdeafcafe/rush/releases/latest";
+fn latest_path() -> String {
+    format!("/repos/{REPO}/releases/latest")
+}
 
 /// GitHub's answer for a release tagged tag, with files names served at
 /// /dl/<name>.
@@ -162,7 +164,7 @@ fn current_from_build() {
 #[test]
 fn latest_reads_githubs_answer() {
     let (url, _) = serving(Box::new(|p, base| {
-        (p == LATEST).then(|| release_json(base, "v0.3.0", &["a.tar.gz".into()]))
+        (p == latest_path()).then(|| release_json(base, "v0.3.0", &["a.tar.gz".into()]))
     }));
     let l = fetch(&url).unwrap();
     assert_eq!(l.version, "0.3.0");
@@ -227,7 +229,7 @@ fn at(s: &str) -> Ms {
 #[test]
 fn check_asks_once_per_every() {
     let (url, asked) = serving(Box::new(|p, base| {
-        (p == LATEST).then(|| release_json(base, "v0.3.0", &[]))
+        (p == latest_path()).then(|| release_json(base, "v0.3.0", &[]))
     }));
     let dir = tempfile::tempdir().unwrap();
     // Go's rush keeps its own answer in the same folder; it's left alone.
@@ -285,7 +287,7 @@ fn forced_check_asks_again() {
     let tag = Arc::new(Mutex::new("v0.1.0-beta.7".to_string()));
     let t = tag.clone();
     let (url, asked) = serving(Box::new(move |p, base| {
-        (p == LATEST).then(|| release_json(base, &t.lock().unwrap(), &[]))
+        (p == latest_path()).then(|| release_json(base, &t.lock().unwrap(), &[]))
     }));
     let dir = tempfile::tempdir().unwrap();
     let t0 = at("2026-11-05T10:00:00Z");
@@ -357,7 +359,7 @@ impl Host for Steps {
 #[test]
 fn install_under_homebrew_runs_brew_upgrade() {
     let (url, _) = serving(Box::new(|p, base| {
-        (p == LATEST).then(|| release_json(base, "v0.3.0", &[]))
+        (p == latest_path()).then(|| release_json(base, "v0.3.0", &[]))
     }));
     let prefix = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -438,7 +440,7 @@ fn serving_release(tgz: Vec<u8>, sum: String) -> String {
     let name = tarball("0.3.0", target().unwrap_or("none"));
     let sum_name = format!("{name}.sha256");
     let (url, _) = serving(Box::new(move |p, base| {
-        if p == LATEST {
+        if p == latest_path() {
             Some(release_json(
                 base,
                 "v0.3.0",
@@ -549,7 +551,7 @@ fn install_refuses_what_wasnt_released() {
 
     // A release without this machine's files says which is missing.
     let (url, _) = serving(Box::new(|p, base| {
-        (p == LATEST).then(|| release_json(base, "v0.3.0", &[]))
+        (p == latest_path()).then(|| release_json(base, "v0.3.0", &[]))
     }));
     let bin = tempfile::tempdir().unwrap();
     let exe = bin.path().join("rush");
@@ -596,7 +598,7 @@ fn install_refuses_what_isnt_newer() {
     }
     // Under Homebrew too: brew isn't run.
     let (url, _) = serving(Box::new(|p, base| {
-        (p == LATEST).then(|| release_json(base, "v0.3.0", &[]))
+        (p == latest_path()).then(|| release_json(base, "v0.3.0", &[]))
     }));
     let prefix = tempfile::tempdir().unwrap();
     let exe = prefix.path().join("Cellar/rush/0.3.0/bin/rush");
@@ -652,7 +654,9 @@ fn archive_is_bounded() {
 
 // ---- notes.rs: what's new between two versions (new in the port) ----
 
-const RELEASES: &str = "/repos/0xdeafcafe/rush/releases?per_page=30";
+fn releases_path() -> String {
+    format!("/repos/{REPO}/releases?per_page=30")
+}
 
 const NIGHTLY_BODY: &str = "Automated nightly build of c5d6835f. macOS binaries are ad-hoc or Developer ID signed depending on repository secrets. Not for production use.
 
@@ -714,7 +718,7 @@ fn releases_json() -> Vec<u8> {
 }
 
 fn serving_releases() -> (String, Arc<AtomicUsize>) {
-    serving(Box::new(|p, _| (p == RELEASES).then(releases_json)))
+    serving(Box::new(|p, _| (p == releases_path()).then(releases_json)))
 }
 
 fn versions(ns: &[crate::Notes]) -> Vec<&str> {

@@ -668,6 +668,7 @@ fn write_file(path: &Path, b: &[u8], mode: u32) -> io::Result<()> {
 /// the real one.
 #[doc(hidden)]
 pub mod testing {
+    use std::io::Write;
     use std::path::Path;
 
     /// A brew in prefix/bin that notes each run in prefix/ran (its args and
@@ -679,6 +680,8 @@ pub mod testing {
         let bin = prefix.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let brew = bin.join("brew");
+        // Publish a new script inode rather than rewriting a running one.
+        let next = bin.join("brew-next");
         let put = match installs {
             Some(v) if code == 0 => format!(
                 "mkdir -p '{}'\n",
@@ -691,16 +694,24 @@ pub mod testing {
         } else {
             "echo 'Error: no bottle' >&2\n"
         };
-        std::fs::write(
-            &brew,
-            format!(
-                "#!/bin/sh\necho \"$* noauto=$HOMEBREW_NO_AUTO_UPDATE\" >> '{}'\n[ \"$1\" = update ] && exit 0\necho '==> Upgrading 0xdeafcafe/tap/rush'\n{put}{fail}exit {code}\n",
-                prefix.join("ran").display()
-            ),
-        )
-        .unwrap();
+        let body = format!(
+            "#!/bin/sh\necho \"$* noauto=$HOMEBREW_NO_AUTO_UPDATE\" >> '{}'\n[ \"$1\" = update ] && exit 0\necho '==> Upgrading 0xdeafcafe/tap/rush'\n{put}{fail}exit {code}\n",
+            prefix.join("ran").display()
+        );
+        let mut script = std::fs::File::create(&next).unwrap();
+        script.lock().unwrap();
+        script.write_all(body.as_bytes()).unwrap();
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&brew, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+            .set_permissions(std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        drop(script);
+        // A concurrent fork can inherit the writable description until exec
+        // closes it (rust-lang/rust#114554). This new read-only description
+        // waits for every inherited writer before publishing the executable.
+        let ready = std::fs::File::open(&next).unwrap();
+        ready.lock_shared().unwrap();
+        std::fs::rename(next, brew).unwrap();
     }
 }
 
