@@ -90,7 +90,8 @@ pub fn reap(pid: i32) -> Option<i32> {
 mod tests {
     use super::*;
     use std::io::Read;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
     use std::process::Command;
 
     // A file kept open crosses into what the process execs; one left to
@@ -100,23 +101,43 @@ mod tests {
     fn a_kept_file_survives_exec_and_the_rest_close() {
         for keep in [true, false] {
             let (mut r, w) = std::io::pipe().unwrap();
-            let fd = w.as_raw_fd();
-            if keep {
-                keep_open(fd).unwrap();
-            }
-            let st = Command::new("/bin/sh")
-                .args(["-c", &format!("echo crossed >&{fd}")])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap();
+            // Exercise a high descriptor even when this test runs alone.
+            // SAFETY: duplicates our pipe into a fresh descriptor, without
+            // replacing any descriptor another test owns.
+            let fd = unsafe { libc::fcntl(w.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+            assert!(fd >= 64, "{}", std::io::Error::last_os_error());
+            // SAFETY: the successful fcntl returned a fresh descriptor.
+            let kept = unsafe { OwnedFd::from_raw_fd(fd) };
             drop(w);
+            let mut cmd = Command::new("/bin/sh");
+            // dash's numeric redirection syntax is limited to single digits;
+            // opening /dev/fd works for the actual inherited descriptor.
+            cmd.args(["-c", &format!("echo crossed >/dev/fd/{fd}")]);
+            // SAFETY: the child closure only calls fcntl on its own descriptor.
+            // Keep the parent's CLOEXEC flag set so parallel tests' children
+            // cannot inherit an unintended open writer.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if keep {
+                        keep_open(fd)
+                    } else {
+                        close_on_exec(fd)
+                    }
+                });
+            }
+            let out = cmd.output().unwrap();
+            drop(kept);
             let mut got = String::new();
             r.read_to_string(&mut got).unwrap();
             if keep {
-                assert!(st.success());
+                assert!(
+                    out.status.success(),
+                    "fd {fd}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
                 assert_eq!(got, "crossed\n");
             } else {
-                assert!(!st.success(), "a closed file was written to");
+                assert!(!out.status.success(), "a closed file was written to");
                 assert_eq!(got, "");
             }
         }
