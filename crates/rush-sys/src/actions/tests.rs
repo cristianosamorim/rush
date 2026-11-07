@@ -20,9 +20,11 @@ fn end_tree_ends_a_pipeline_that_ignores_term() {
         .spawn()
         .unwrap();
     let mut line = String::new();
-    BufReader::new(c.stderr.take().unwrap())
-        .read_line(&mut line)
-        .unwrap();
+    // Keep stderr open through end_tree: dash may report a terminated
+    // pipeline after SIGTERM, and a closed reader would SIGPIPE the shell
+    // before its children are signalled.
+    let mut stderr = BufReader::new(c.stderr.take().unwrap());
+    stderr.read_line(&mut line).unwrap();
     assert_eq!(line, "ready\n");
     let root_pid = c.id() as Pid;
     std::thread::spawn(move || c.wait());
