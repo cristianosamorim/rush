@@ -452,19 +452,23 @@ pub fn browse(m: &mut Model, url: &str) {
         {
             let url = url.clone();
             move || {
-                std::process::Command::new("open")
-                    .arg(&url)
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                    .map_err(|e| e.to_string())
-                    .and_then(|o| {
-                        let s = o.status;
-                        if s.success() {
-                            Ok(())
-                        } else {
-                            Err(format!("open said {s}"))
-                        }
-                    })
+                std::process::Command::new(if cfg!(target_os = "macos") {
+                    "open"
+                } else {
+                    "xdg-open"
+                })
+                .arg(&url)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|e| e.to_string())
+                .and_then(|o| {
+                    let s = o.status;
+                    if s.success() {
+                        Ok(())
+                    } else {
+                        Err(format!("open said {s}"))
+                    }
+                })
             }
         },
         move |m, r| {

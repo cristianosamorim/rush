@@ -6,6 +6,16 @@ use std::path::Path;
 
 use rush_voice::{Command, Live, bundle, is_bundle_program, level, split};
 
+#[cfg(target_os = "linux")]
+#[test]
+fn apple_speech_is_unavailable_without_starting_a_helper() {
+    assert!(!rush_voice::available());
+    assert!(rush_voice::devices().is_empty());
+    assert!(rush_voice::start("", Vec::new(), |_| {}).is_err());
+    assert!(rush_voice::helper_main().is_err());
+    assert!(rush_voice::build_app().is_err());
+}
+
 #[test]
 fn commands_on_the_wire() {
     let cases = [

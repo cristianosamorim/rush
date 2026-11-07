@@ -23,7 +23,9 @@ pub mod bundle;
 mod client;
 mod words;
 
+#[cfg(target_os = "macos")]
 mod audio;
+#[cfg(target_os = "macos")]
 mod helper;
 
 pub use bundle::{app_path, build_app};
@@ -140,18 +142,31 @@ pub fn start(
     context: Vec<String>,
     out: impl FnMut(Live) + Send + 'static,
 ) -> Result<Dictation, String> {
+    if !available() {
+        return Err("Apple speech recognition is only available on macOS 26 or later".into());
+    }
     client::start(device, context, out).map(|inner| Dictation { inner })
 }
 
 /// The Mac's microphones, the input first. Asked in this process (listing
 /// them needs no permission).
 pub fn devices() -> Vec<Device> {
-    audio::devices()
+    #[cfg(target_os = "macos")]
+    {
+        audio::devices()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
 }
 
 /// Whether push-to-talk can work here at all: macOS 26 or later, where the
 /// on-device speech model is.
 pub fn available() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         // sw_vers, not NSProcessInfo: a binary built against an older
@@ -172,7 +187,7 @@ pub fn socket() -> PathBuf {
 
 /// Whether this process is the helper: the binary inside its bundle.
 pub fn bundled() -> bool {
-    std::env::current_exe().is_ok_and(|p| is_bundle_program(&p))
+    cfg!(target_os = "macos") && std::env::current_exe().is_ok_and(|p| is_bundle_program(&p))
 }
 
 /// Whether a program at p is the helper's: [`EXECUTABLE`] in a bundle's
@@ -186,5 +201,12 @@ pub fn is_bundle_program(p: &std::path::Path) -> bool {
 /// Runs the helper until it quits; on the main thread, as the bundle's
 /// program.
 pub fn helper_main() -> Result<(), String> {
-    helper::run()
+    #[cfg(target_os = "macos")]
+    {
+        helper::run()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Apple speech recognition is only available on macOS".into())
+    }
 }

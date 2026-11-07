@@ -125,8 +125,19 @@ fn resolve_cache_dir() -> PathBuf {
     }
 }
 
-/// os.UserCacheDir: ~/Library/Caches.
+/// os.UserCacheDir: ~/Library/Caches on macOS, XDG_CACHE_HOME or
+/// ~/.cache on Linux.
 fn user_cache_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "linux") {
+        if let Some(d) = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .filter(|d| d.is_absolute())
+        {
+            return Some(d);
+        }
+        let h = home_dir();
+        return (!h.as_os_str().is_empty()).then(|| h.join(".cache"));
+    }
     let h = home_dir();
     (!h.as_os_str().is_empty()).then(|| h.join("Library").join("Caches"))
 }

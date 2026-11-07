@@ -146,7 +146,14 @@ fn login_shell() -> String {
     std::env::var("SHELL")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/zsh".into())
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                "/bin/zsh"
+            } else {
+                "/bin/sh"
+            }
+            .into()
+        })
 }
 
 /// The id a paused command of run r is kept under, for rush to let it go

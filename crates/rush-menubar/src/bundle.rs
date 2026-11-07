@@ -114,6 +114,9 @@ pub type Error = String;
 /// one already running is left alone unless it was just rebuilt. rushes
 /// starting together take turns, so only the first builds and opens it.
 pub fn start() -> Result<(), Error> {
+    if !cfg!(target_os = "macos") {
+        return Err("the menu bar app is only available on macOS".into());
+    }
     let _ = make_dir(&dir());
     // Held until start returns: rushes starting together take turns.
     let _turn = fs::OpenOptions::new()
@@ -268,6 +271,9 @@ pub(crate) fn stamp(bin: &Path, full: bool) -> String {
 /// Makes the app bundle, unless the one there was built from this rush.
 /// Returns whether it built one.
 pub fn build_app() -> Result<bool, Error> {
+    if !cfg!(target_os = "macos") {
+        return Err("the menu bar app is only available on macOS".into());
+    }
     let app = app_path();
     let bin = crate::exe();
     let full = tiles();

@@ -3,11 +3,16 @@
 //! menu's rows of every kind, and the answers a menu item sends. Nothing
 //! is shown and no feed starts.
 
+#[cfg(not(target_os = "macos"))]
+fn main() {}
+
+#[cfg(target_os = "macos")]
 fn main() {
     rush_testenv::assert_sandboxed(); // every test in a throwaway home
     run();
 }
 
+#[cfg(target_os = "macos")]
 fn run() {
     use rush_menubar::wire::{Account, Line, Waiting, Window, Working};
     let state = Line {

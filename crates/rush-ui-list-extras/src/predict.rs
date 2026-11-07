@@ -167,6 +167,7 @@ fn stat_of(m: &std::fs::Metadata) -> Option<Stat> {
 /// Whether the machine is short of memory (the kernel's pressure level
 /// past normal): nothing is read ahead then.
 fn memory_short() -> bool {
+    #[cfg(target_os = "macos")]
     {
         let mut v: u32 = 0;
         let mut len = std::mem::size_of::<u32>();
@@ -182,6 +183,25 @@ fn memory_short() -> bool {
             )
         };
         r == 0 && v > 1
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(info) = std::fs::read_to_string("/proc/meminfo") else {
+            return false;
+        };
+        let value = |key: &str| {
+            info.lines().find_map(|line| {
+                let (name, rest) = line.split_once(':')?;
+                (name == key)
+                    .then(|| rest.split_whitespace().next()?.parse::<u64>().ok())
+                    .flatten()
+            })
+        };
+        matches!((value("MemAvailable"), value("MemTotal")), (Some(a), Some(t)) if t > 0 && a < t / 10)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
     }
 }
 

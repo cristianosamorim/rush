@@ -208,6 +208,9 @@ pub struct MenuBarSheet {
 /// Asks, the first time rush opens on a Mac (after the layout), whether
 /// to run the menu bar icon (askMenuBar).
 pub fn ask_menu_bar(m: &mut Model) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
     let c = config(m);
     if c.menu_bar || c.menu_bar_asked || m.sheet.is_some() {
         return;

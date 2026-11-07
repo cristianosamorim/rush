@@ -40,7 +40,10 @@ pub use notes::{Item, NOTES_CACHE, NOTES_JOB, Notes, between, of, text, tidy};
 pub use semver::newer;
 
 /// Where rush is released.
+#[cfg(not(target_os = "linux"))]
 pub const REPO: &str = "0xdeafcafe/rush";
+#[cfg(target_os = "linux")]
+pub const REPO: &str = "cristianosamorim/rush";
 
 /// GitHub's API.
 pub const API: &str = "https://api.github.com";
@@ -164,8 +167,14 @@ impl Host for Quiet {}
 /// The target rush is released for on this machine, as the release's file
 /// names have it; None where there's no release built for it.
 pub const fn target() -> Option<&'static str> {
-    if cfg!(target_arch = "aarch64") {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Some("aarch64-apple-darwin")
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu"
+    )) {
+        Some("x86_64-unknown-linux-gnu")
     } else {
         None
     }

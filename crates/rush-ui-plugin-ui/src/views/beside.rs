@@ -331,7 +331,13 @@ fn open_link(m: &mut Model, link: &str) {
     let l = link.to_string();
     m.later(
         move || {
-            let _ = std::process::Command::new("open").arg(&l).output();
+            let _ = std::process::Command::new(if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            })
+            .arg(&l)
+            .output();
         },
         |_, _| Out::Idle,
     );

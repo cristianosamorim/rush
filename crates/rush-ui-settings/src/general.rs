@@ -411,7 +411,12 @@ pub fn sections(m: &Model) -> Vec<Section> {
         super::sheets::menu_bar_changed(m, v == "on");
         Out::Draw
     }));
-    secs.push(Section::new("When an agent needs you", vec![notify, menu]));
+    let notifications = if cfg!(target_os = "macos") {
+        vec![notify, menu]
+    } else {
+        vec![notify]
+    };
+    secs.push(Section::new("When an agent needs you", notifications));
 
     let feed = choice(
         "The feed",

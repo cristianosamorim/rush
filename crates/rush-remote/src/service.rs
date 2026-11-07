@@ -37,7 +37,7 @@ pub fn service_log() -> PathBuf {
 
 /// Whether remote mode is on: serve is kept running.
 pub fn remote_on() -> bool {
-    service_plist().exists()
+    cfg!(target_os = "macos") && service_plist().exists()
 }
 
 /// s with HTML's five escaped, as html.EscapeString does.
@@ -85,6 +85,9 @@ pub fn set_remote(on: bool, exe: &str) -> Result<(), String> {
     if rush_core::sandbox::active() {
         // A test never reaches the user's launchd.
         return Err("remote mode isn't switched in a test's sandbox".into());
+    }
+    if !cfg!(target_os = "macos") {
+        return Err("automatic remote startup is only available on macOS; run rush serve as a user service on Linux".into());
     }
     // SAFETY: getuid only asks.
     let uid = unsafe { libc::getuid() };

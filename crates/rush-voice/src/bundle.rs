@@ -66,6 +66,9 @@ pub fn stamp(bin: &Path) -> String {
 /// Makes the helper's bundle, unless the one there was built from this
 /// rush. Returns whether it built one.
 pub fn build_app() -> Result<bool, String> {
+    if !cfg!(target_os = "macos") {
+        return Err("Apple speech recognition is only available on macOS".into());
+    }
     let app = app_path();
     let bin = exe();
     let stamp = stamp(&bin);

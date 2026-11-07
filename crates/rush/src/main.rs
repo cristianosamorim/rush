@@ -609,9 +609,11 @@ fn raise_open_files() {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
         return;
     }
+    #[allow(unused_mut)]
     let mut want = r.rlim_max;
     // macOS refuses more than kern.maxfilesperproc, even under an
     // unlimited hard limit.
+    #[cfg(target_os = "macos")]
     {
         let mut n: libc::c_int = 0;
         let mut size = std::mem::size_of::<libc::c_int>();
@@ -1198,8 +1200,19 @@ mod tests {
         // could keep the lock after the test let it go. lockf holds the
         // file's flock until its cat's stdin closes.
         let p = dir.join("lock");
-        let mut other = std::process::Command::new("/usr/bin/lockf")
-            .args(["-k", "-t", "0"])
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let mut c = std::process::Command::new("/usr/bin/lockf");
+            c.args(["-k", "-t", "0"]);
+            c
+        };
+        #[cfg(not(target_os = "macos"))]
+        let mut command = {
+            let mut c = std::process::Command::new("flock");
+            c.arg("-x");
+            c
+        };
+        let mut other = command
             .arg(&p)
             .args(["/bin/sh", "-c", "echo held; exec /bin/cat"])
             .stdin(std::process::Stdio::piped())

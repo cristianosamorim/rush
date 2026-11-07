@@ -808,20 +808,21 @@ fn ready_row(r: &Readiness) -> Setting {
     row
 }
 
-/// Opens url with macOS's open, off the UI thread; nothing elsewhere.
+/// Opens url with the desktop's opener, off the UI thread.
 fn open_url(url: &str) {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
     let url = url.to_string();
     let _ = std::thread::Builder::new()
         .name("rush-open-fix".into())
         .spawn(move || {
-            let _ = std::process::Command::new("open")
-                .arg(url)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            let _ = std::process::Command::new(if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            })
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         });
 }
 

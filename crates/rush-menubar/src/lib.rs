@@ -19,6 +19,7 @@ pub mod source;
 pub mod terminal;
 pub mod wire;
 
+#[cfg(target_os = "macos")]
 pub mod app;
 
 use std::path::PathBuf;
@@ -35,7 +36,7 @@ pub fn exe() -> PathBuf {
 /// Whether this process is the menu bar app: the bundle's program, started
 /// from inside it.
 pub fn bundled() -> bool {
-    std::env::current_exe().is_ok_and(|p| is_bundle_program(&p))
+    cfg!(target_os = "macos") && std::env::current_exe().is_ok_and(|p| is_bundle_program(&p))
 }
 
 fn is_bundle_program(p: &std::path::Path) -> bool {
@@ -47,13 +48,23 @@ fn is_bundle_program(p: &std::path::Path) -> bool {
 /// Runs the menu bar app until it quits; on the main thread, as the
 /// bundle's program.
 pub fn app_main() -> Result<(), String> {
-    app::run();
-    Ok(())
+    #[cfg(target_os = "macos")]
+    {
+        app::run();
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("the menu bar app is only available on macOS".into())
+    }
 }
 
 /// `rush menubar [off|feed]`: runs the menu bar icon, its feed (which the
 /// icon runs), or takes it away. What it prints goes to stdout.
 pub fn cli(args: &[String]) -> Result<(), String> {
+    if !cfg!(target_os = "macos") && args.is_empty() {
+        return Err("the menu bar app is only available on macOS".into());
+    }
     let mut st = rush_state::Store::load();
     match args.first().map(String::as_str) {
         Some("feed") => {
@@ -91,6 +102,16 @@ pub fn cli(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_menu_is_unavailable_without_starting_an_app() {
+        assert!(!bundled());
+        assert!(app_main().is_err());
+        assert!(start().is_err());
+        assert!(build_app().is_err());
+        assert!(cli(&[]).unwrap_err().contains("only available on macOS"));
+    }
 
     #[test]
     fn knows_its_bundle() {
