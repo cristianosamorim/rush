@@ -896,14 +896,15 @@ fn spawn(term: &str, (cols, rows): (u16, u16)) -> io::Result<(Child, File)> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    // SAFETY: openpty fills two fds we then own.
+    // SAFETY: openpty fills two fds we then own. Darwin takes a mutable
+    // winsize pointer; Linux accepts that pointer as const.
     let rc = unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut ws,
+            &raw mut ws,
         )
     };
     if rc != 0 {
