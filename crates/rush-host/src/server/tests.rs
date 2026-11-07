@@ -1035,9 +1035,7 @@ fn owner_exit_stops_once_while_provider_close_is_blocked() {
 
     owner.kill().unwrap();
     owner.wait().unwrap();
-    let entered = entered_rx
-        .recv_timeout(Duration::from_secs(10))
-        .is_ok();
+    let entered = entered_rx.recv_timeout(Duration::from_secs(10)).is_ok();
     // A level-triggered pidfd used to enqueue another stop while close() was
     // blocked, letting that second stop set quit and end the server early.
     let exited_while_blocked = done_rx.recv_timeout(Duration::from_millis(100)).is_ok();
