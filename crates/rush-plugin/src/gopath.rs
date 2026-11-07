@@ -186,6 +186,8 @@ const MODE_STICKY: u32 = 1 << 20;
 
 /// The file's mode as Go's fs.FileMode has it: permission bits, then a
 /// bit of its own for each kind of file and for setuid, setgid and sticky.
+// libc's mode_t is u16 on Darwin and u32 on Linux.
+#[cfg_attr(target_os = "linux", allow(clippy::unnecessary_cast))]
 pub fn file_mode(md: &Metadata) -> u32 {
     let raw = md.permissions().mode();
     let mut m = raw & 0o777;

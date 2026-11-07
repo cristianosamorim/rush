@@ -53,6 +53,8 @@ pub(crate) struct Inner {
     dirty: bool,
     #[cfg(test)]
     add_watch_errno: Option<i32>,
+    #[cfg(test)]
+    remove_on_add_failure: bool,
 }
 
 impl Inner {
@@ -76,19 +78,31 @@ impl Inner {
             dirty: true,
             #[cfg(test)]
             add_watch_errno: None,
+            #[cfg(test)]
+            remove_on_add_failure: false,
         }
     }
 
     fn remove_nodes(&mut self) {
-        if let Some(fd) = &self.fd {
-            for &wd in self.nodes.values() {
-                // SAFETY: wd belongs to this inotify instance. The kernel
-                // queues IN_IGNORED; stale events are ignored later.
-                unsafe { libc::inotify_rm_watch(fd.as_raw_fd(), wd) };
-            }
+        let watches: Vec<RawFd> = self.nodes.values().copied().collect();
+        for wd in watches {
+            self.remove_watch(wd);
         }
         self.nodes.clear();
         self.by_fd.clear();
+    }
+
+    fn remove_watch(&mut self, wd: RawFd) {
+        let Some(fd) = self.fd.as_ref().map(AsRawFd::as_raw_fd) else {
+            return;
+        };
+        // SAFETY: wd belongs to this inotify instance. DELETE_SELF and
+        // MOVE_SELF may already have retired it, in which case EINVAL is
+        // expected and harmless.
+        let result = unsafe { libc::inotify_rm_watch(fd, wd) };
+        if result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL) {
+            self.dirty = true;
+        }
     }
 
     fn remove_path(&mut self, path: &Path) {
@@ -96,12 +110,7 @@ impl Inner {
             return;
         };
         self.by_fd.remove(&wd);
-        if let Some(fd) = &self.fd {
-            // SAFETY: wd belongs to this inotify instance. The kernel queues
-            // IN_IGNORED; it is intentionally ignored by take_events because
-            // the descriptor may be reused for a later registration.
-            unsafe { libc::inotify_rm_watch(fd.as_raw_fd(), wd) };
-        }
+        self.remove_watch(wd);
     }
 
     fn failed_registration(&mut self, errno: Option<i32>, missing_ok: bool) -> AddResult {
@@ -170,28 +179,7 @@ impl Inner {
             }
         }
 
-        let needed_parents: HashSet<PathBuf> = self
-            .missing
-            .iter()
-            .filter_map(|p| nearest_existing_parent(p))
-            .collect();
-        let stale_parents: Vec<PathBuf> = self
-            .nodes
-            .iter()
-            .filter_map(|(path, wd)| match self.by_fd.get(wd) {
-                Some(Node::Parent) if !needed_parents.contains(path) => Some(path.clone()),
-                _ => None,
-            })
-            .collect();
-        for path in stale_parents {
-            self.remove_path(&path);
-        }
-
-        for parent in needed_parents {
-            if !self.nodes.contains_key(&parent) {
-                let _ = self.add_node(parent, Node::Parent, false);
-            }
-        }
+        self.sync_missing_parents();
 
         // A target can appear after the metadata pass but before its parent
         // stand-in is registered. Promote it now so that appearance does not
@@ -214,6 +202,65 @@ impl Inner {
                 AddResult::Failed => {}
             }
         }
+        self.sync_missing_parents();
+    }
+
+    /// Registers stand-ins from the nearest existing ancestor downward. The
+    /// metadata check and registration are separate system calls, so an
+    /// intermediate directory can appear between them. Recompute after each
+    /// pass until every current ancestor is covered; if the filesystem keeps
+    /// changing or a parent cannot be watched, use the bounded dirty fallback.
+    fn sync_missing_parents(&mut self) {
+        const MAX_PASSES: usize = 64;
+        for _ in 0..MAX_PASSES {
+            let needed: HashSet<PathBuf> = self
+                .missing
+                .iter()
+                .filter_map(|p| nearest_existing_parent(p))
+                .collect();
+
+            let stale: Vec<PathBuf> = self
+                .nodes
+                .iter()
+                .filter_map(|(path, wd)| match self.by_fd.get(wd) {
+                    Some(Node::Parent) if !needed.contains(path) => Some(path.clone()),
+                    _ => None,
+                })
+                .collect();
+            for path in stale {
+                self.remove_path(&path);
+            }
+
+            if needed.is_empty() {
+                if !self.missing.is_empty() {
+                    self.registration_failed = true;
+                    self.dirty = true;
+                }
+                return;
+            }
+
+            for parent in &needed {
+                if !self.nodes.contains_key(parent) {
+                    #[cfg(test)]
+                    watched::before_parent(parent);
+                    match self.add_node(parent.clone(), Node::Parent, false) {
+                        AddResult::Added | AddResult::Already => {}
+                        AddResult::Missing | AddResult::Failed => return,
+                    }
+                }
+            }
+
+            let stable = self
+                .missing
+                .iter()
+                .filter_map(|p| nearest_existing_parent(p))
+                .all(|p| self.nodes.contains_key(&p));
+            if stable {
+                return;
+            }
+        }
+        self.registration_failed = true;
+        self.dirty = true;
     }
 
     fn add_exact(&mut self, path: &Path) -> AddResult {
@@ -239,6 +286,10 @@ impl Inner {
         };
         #[cfg(test)]
         if let Some(errno) = self.add_watch_errno.take() {
+            if self.remove_on_add_failure {
+                let _ = std::fs::remove_file(&path);
+                self.remove_on_add_failure = false;
+            }
             return self.failed_registration(Some(errno), missing_ok);
         }
         // SAFETY: c is NUL-terminated and fd is a live inotify descriptor.
@@ -267,6 +318,7 @@ impl Inner {
             self.nodes.remove(&path);
         }
         self.by_fd.remove(&wd);
+        self.remove_watch(wd);
     }
 
     fn take_events(&mut self) {
@@ -656,25 +708,119 @@ impl Watcher {
 #[cfg(test)]
 pub(crate) mod watched {
     use super::File;
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
-    use std::sync::{Condvar, Mutex};
+    use std::sync::{Condvar, Mutex, OnceLock};
 
-    static W: (Mutex<Vec<PathBuf>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
-
-    /// Signals after grown's initial stat and immediately before registration.
-    pub(crate) fn before_watch(files: &[File]) {
-        W.0.lock()
-            .unwrap()
-            .extend(files.iter().map(|f| f.path.clone()));
-        W.1.notify_all();
+    #[derive(Default)]
+    struct State {
+        armed: HashSet<PathBuf>,
+        entered: HashSet<PathBuf>,
+        released: HashSet<PathBuf>,
+        parent_armed: HashSet<PathBuf>,
+        parent_entered: HashSet<PathBuf>,
+        parent_released: HashSet<PathBuf>,
     }
 
-    /// Blocks until grown reaches its registration boundary for p.
-    pub(crate) fn wait_before_watch(path: &Path) {
-        let g = W.0.lock().unwrap();
-        let _g =
-            W.1.wait_while(g, |paths| !paths.iter().any(|p| p == path))
-                .unwrap();
+    static W: OnceLock<(Mutex<State>, Condvar)> = OnceLock::new();
+
+    fn barrier() -> &'static (Mutex<State>, Condvar) {
+        W.get_or_init(|| (Mutex::new(State::default()), Condvar::new()))
+    }
+
+    /// Arms the deterministic registration barrier for one unique test path.
+    pub(crate) fn arm(path: &Path) {
+        barrier().0.lock().unwrap().armed.insert(path.to_path_buf());
+    }
+
+    /// Signals after grown's initial stat and blocks before registration until
+    /// the test has performed its write and released the barrier.
+    pub(crate) fn before_watch(files: &[File]) {
+        let paths: Vec<PathBuf> = {
+            let state = barrier().0.lock().unwrap();
+            files
+                .iter()
+                .map(|f| f.path.clone())
+                .filter(|p| state.armed.contains(p))
+                .collect()
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let mut state = barrier().0.lock().unwrap();
+        for path in &paths {
+            state.entered.insert(path.clone());
+        }
+        barrier().1.notify_all();
+        while !paths.iter().all(|path| state.released.contains(path)) {
+            state = barrier().1.wait(state).unwrap();
+        }
+        for path in paths {
+            state.armed.remove(&path);
+            state.entered.remove(&path);
+            state.released.remove(&path);
+        }
+    }
+
+    /// Blocks until grown reaches the registration boundary for p.
+    pub(crate) fn wait_entered(path: &Path) {
+        let mut state = barrier().0.lock().unwrap();
+        while !state.entered.contains(path) {
+            state = barrier().1.wait(state).unwrap();
+        }
+    }
+
+    /// Releases grown to install its inotify watch.
+    pub(crate) fn release(path: &Path) {
+        barrier()
+            .0
+            .lock()
+            .unwrap()
+            .released
+            .insert(path.to_path_buf());
+        barrier().1.notify_all();
+    }
+
+    /// Arms a barrier immediately before a missing-path parent registration.
+    pub(crate) fn arm_parent(path: &Path) {
+        barrier()
+            .0
+            .lock()
+            .unwrap()
+            .parent_armed
+            .insert(path.to_path_buf());
+    }
+
+    pub(crate) fn before_parent(path: &Path) {
+        let mut state = barrier().0.lock().unwrap();
+        if !state.parent_armed.contains(path) {
+            return;
+        }
+        state.parent_entered.insert(path.to_path_buf());
+        barrier().1.notify_all();
+        while !state.parent_released.contains(path) {
+            state = barrier().1.wait(state).unwrap();
+        }
+        state.parent_armed.remove(path);
+        state.parent_entered.remove(path);
+        state.parent_released.remove(path);
+    }
+
+    pub(crate) fn wait_parent_entered(path: &Path) {
+        let mut state = barrier().0.lock().unwrap();
+        while !state.parent_entered.contains(path) {
+            state = barrier().1.wait(state).unwrap();
+        }
+    }
+
+    pub(crate) fn release_parent(path: &Path) {
+        barrier()
+            .0
+            .lock()
+            .unwrap()
+            .parent_released
+            .insert(path.to_path_buf());
+        barrier().1.notify_all();
     }
 }
 
@@ -729,12 +875,40 @@ mod tests {
     }
 
     #[test]
+    fn missing_parent_registration_descends_after_intermediate_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().to_path_buf();
+        let intermediate = parent.join("a");
+        let target = intermediate.join("state.json");
+        let w = Arc::new(Watcher::new());
+        let (tx, rx) = mpsc::channel();
+        watched::arm_parent(&parent);
+        let watch_w = w.clone();
+        let watch_target = target.clone();
+        std::thread::spawn(move || {
+            watch_w.watch(&[&watch_target]);
+            tx.send(()).unwrap();
+        });
+        watched::wait_parent_entered(&parent);
+        // This lands after the nearest ancestor was selected but before the
+        // root watch is installed. The second pass must descend into `a`.
+        std::fs::create_dir(&intermediate).unwrap();
+        watched::release_parent(&parent);
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        std::fs::write(&target, "state\n").unwrap();
+        assert!(w.wait(None, Some(Duration::from_secs(2))));
+        assert!(w.changes().0.contains(&target));
+    }
+
+    #[test]
     fn grown_catches_write_between_stat_and_registration() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("race.jsonl");
         std::fs::write(&path, "a\n").unwrap();
         let stop = Arc::new(Stop::new().unwrap());
         let (tx, rx) = mpsc::channel();
+        watched::arm(&path);
         let grown_stop = stop.clone();
         let grown_path = path.clone();
         std::thread::spawn(move || {
@@ -747,13 +921,14 @@ mod tests {
             ))
             .unwrap();
         });
-        watched::wait_before_watch(&path);
+        watched::wait_entered(&path);
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         f.write_all(b"b\n").unwrap();
         drop(f);
+        watched::release(&path);
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(true));
         stop.close();
     }
@@ -776,6 +951,40 @@ mod tests {
         // lose the event already queued for it.
         w.watch(&[&path]);
         assert!(w.changes().0.contains(&path));
+    }
+
+    #[test]
+    fn rotated_files_retire_old_kernel_watches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(&path, "a\n").unwrap();
+        let w = Watcher::new();
+        w.watch(&[&path]);
+        w.changes();
+
+        for i in 0..24 {
+            let archived = dir.path().join(format!("events-{i}.jsonl"));
+            std::fs::rename(&path, &archived).unwrap();
+            assert!(w.wait(None, Some(Duration::from_secs(2))));
+            let _ = w.changes();
+            assert!(!w.watching(&path));
+
+            w.watch(&[&path]);
+            std::fs::write(&path, format!("{i}\n")).unwrap();
+            assert!(w.wait(None, Some(Duration::from_secs(2))));
+            assert!(w.changes().0.contains(&path));
+        }
+
+        let fd = {
+            let inner = w.inner();
+            inner.fd.as_ref().unwrap().as_raw_fd()
+        };
+        let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
+        let watches = fdinfo
+            .lines()
+            .filter(|line| line.starts_with("inotify wd:"))
+            .count();
+        assert!(watches <= 1, "rotations left {watches} kernel watches");
     }
 
     #[test]
@@ -827,6 +1036,7 @@ mod tests {
         {
             let mut inner = w.inner();
             inner.add_watch_errno = Some(libc::ENOENT);
+            inner.remove_on_add_failure = true;
         }
         w.watch(&[&path]);
         assert!(!w.watching(&path));
