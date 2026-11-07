@@ -266,7 +266,11 @@ mod tests {
     #[test]
     fn proc_args_keeps_empty_linux_arguments() {
         let mut child = Command::new("sh")
-            .args(["-c", "sleep 30", ""])
+            // Keep the shell itself alive on a pipe. A simple external
+            // command lets dash optimize into that command, which drops the
+            // shell's argv (including the empty $0) before /proc is read.
+            .args(["-c", "read _", ""])
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let args = proc_args(child.id() as i32);
