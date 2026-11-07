@@ -1130,10 +1130,8 @@ fn kimi_live_subagent_child() {
 
 /// Writes a program at dir/name that runs script.
 fn program(dir: &std::path::Path, name: &str, script: &str) -> String {
-    use std::os::unix::fs::PermissionsExt;
     let p = dir.join(name);
-    std::fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    rush_testenv::write_executable(&p, format!("#!/bin/sh\n{script}\n").as_bytes()).unwrap();
     p.to_string_lossy().into_owned()
 }
 

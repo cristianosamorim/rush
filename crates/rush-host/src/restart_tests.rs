@@ -15,12 +15,14 @@ use crate::wire::Config;
 /// A stand-in installed rush that answers `rush host preflight` with
 /// what it prints and its exit status.
 fn installed(home: &Home, says: &str, status: i32) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let bin = home.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let exe = bin.join("rush");
-    std::fs::write(&exe, format!("#!/bin/sh\necho '{says}'\nexit {status}\n")).unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    rush_testenv::write_executable(
+        &exe,
+        format!("#!/bin/sh\necho '{says}'\nexit {status}\n").as_bytes(),
+    )
+    .unwrap();
     exe
 }
 

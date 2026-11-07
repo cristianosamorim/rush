@@ -340,13 +340,11 @@ mod tests {
     fn a_failed_run_says_why() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("claude");
-        fs::write(
+        rush_testenv::write_executable(
             &bin,
-            "#!/bin/sh\necho \"$@\" >&2\necho 'no such plugin' >&2\nexit 1\n",
+            "#!/bin/sh\necho \"$@\" >&2\necho 'no such plugin' >&2\nexit 1\n".as_bytes(),
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         let a = Account::at("", dir.path());
         let err = plugin_cli_with(&bin.to_string_lossy(), &a, "", &["details", "x"]).unwrap_err();
         assert_eq!(err.to_string(), "claude plugin details: no such plugin");

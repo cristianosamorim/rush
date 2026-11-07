@@ -336,9 +336,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let script = |name: &str, body: &str| {
             let p = d.path().join(name);
-            std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            rush_testenv::write_executable(&p, format!("#!/bin/sh\n{body}").as_bytes()).unwrap();
             p
         };
         let ok = script("ok", &format!("echo '{PREFLIGHT_OK}'\n"));

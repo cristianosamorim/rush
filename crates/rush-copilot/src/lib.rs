@@ -624,17 +624,15 @@ mod tests {
 
     /// A gh that answers auth status and auth token from a script.
     fn fake_gh(dir: &Path) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let p = dir.join("gh");
-        std::fs::write(
+        rush_testenv::write_executable(
             &p,
             "#!/bin/sh\ncase \"$1 $2\" in\n\
              'auth status') echo '{\"hosts\":{\"github.com\":[{\"login\":\"octo\",\"active\":true}]}}' ;;\n\
              'auth token') if [ \"$5\" = -u ]; then echo \"tok-$6\"; else echo tok-active; fi ;;\n\
-             *) exit 1 ;;\nesac\n",
+             *) exit 1 ;;\nesac\n".as_bytes(),
         )
         .unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p.to_string_lossy().into_owned()
     }
 
@@ -703,7 +701,6 @@ mod tests {
     // folder, on gh's sign-in.
     #[test]
     fn starts_over_acp() {
-        use std::os::unix::fs::PermissionsExt;
         let bin = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let gh = fake_gh(bin.path());
@@ -722,8 +719,7 @@ cat > /dev/null
             home.path().display()
         );
         let p = bin.path().join(COMMAND);
-        std::fs::write(&p, script).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        rush_testenv::write_executable(&p, script.as_bytes()).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let conn = c
             .start(

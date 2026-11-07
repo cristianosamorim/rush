@@ -112,7 +112,7 @@ fn cargo_build(pkg: &str, out: &Path) {
         "cargo build -p {pkg}: {}",
         String::from_utf8_lossy(&o.stderr)
     );
-    std::fs::copy(target.join("debug").join(pkg), out).unwrap();
+    rush_testenv::copy_executable(&target.join("debug").join(pkg), out).unwrap();
 }
 
 /// Runs a broker in home until nothing is approved; the broker, once it
@@ -307,16 +307,16 @@ fn broker_runs_the_kanban_example() {
     let cli = home.path().join("bin/kanban");
     std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(
+        rush_testenv::write_executable_with_mode(
             &cli,
             format!(
                 "#!/bin/sh\necho \"$@\" >> {}/calls\necho '{{}}'\n",
                 kb.display()
-            ),
+            )
+            .as_bytes(),
+            0o700,
         )
         .unwrap();
-        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     // An agent the plugin started for the card, as its host publishes it.

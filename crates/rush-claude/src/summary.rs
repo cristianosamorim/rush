@@ -89,7 +89,6 @@ fn read_answer(stdout: &[u8], ran: bool, status: &str, stderr: &str) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn answers_as_claude_gives_them() {
@@ -126,12 +125,11 @@ mod tests {
     fn runs_a_fake_claude() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("claude");
-        std::fs::write(
+        rush_testenv::write_executable(
             &bin,
-            "#!/bin/sh\nin=$(cat)\nprintf '{\"result\":\"%s via %s\"}' \"$in\" \"$3\"\n",
+            "#!/bin/sh\nin=$(cat)\nprintf '{\"result\":\"%s via %s\"}' \"$in\" \"$3\"\n".as_bytes(),
         )
         .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let env = vec![format!(
             "PATH={}",
             std::env::var("PATH").unwrap_or_default()

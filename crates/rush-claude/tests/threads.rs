@@ -33,13 +33,12 @@ fn a_waiting_session_holds_one_thread() {
     // A claude that answers each line on stdin with one on stdout, and
     // says something on stderr first.
     let bin = dir.path().join("claude");
-    std::fs::write(
+    rush_testenv::write_executable(
         &bin,
-        "#!/bin/sh\necho starting >&2\nwhile read -r l; do echo '{\"type\":\"heard\"}'; done\n",
+        "#!/bin/sh\necho starting >&2\nwhile read -r l; do echo '{\"type\":\"heard\"}'; done\n"
+            .as_bytes(),
     )
     .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (heard_tx, heard) = mpsc::channel::<Vec<u8>>();
     let heard_tx = std::sync::Mutex::new(heard_tx);
     let o = Options {

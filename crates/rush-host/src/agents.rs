@@ -632,11 +632,9 @@ mod tests {
     /// general-purpose.
     #[test]
     fn a_claude_session_on_a_fresh_config_has_its_own_models() {
-        use std::os::unix::fs::PermissionsExt;
         let _home = crate::testing::Home::new();
         let bin = rush_testenv::root().join("bin").join("claude");
-        std::fs::write(&bin, "#!/bin/sh\necho 2.1.0\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        rush_testenv::write_executable(&bin, b"#!/bin/sh\necho 2.1.0\n").unwrap();
         let reg = Registry::new();
         reg.register(rush_claude::Claude::at(rush_claude::Account::home()));
         let defs = agent_defs(&reg, "claude");

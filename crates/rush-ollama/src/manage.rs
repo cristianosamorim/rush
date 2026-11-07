@@ -435,11 +435,9 @@ mod tests {
     // A server that ends before it answers says how it ended.
     #[test]
     fn a_server_that_exits_says_so() {
-        use std::os::unix::fs::PermissionsExt;
         let bin = tempfile::tempdir().unwrap();
         let p = bin.path().join("ollama");
-        std::fs::write(&p, "#!/bin/sh\n[ \"$1\" = serve ] && exit 3\n").unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        rush_testenv::write_executable(&p, b"#!/bin/sh\n[ \"$1\" = serve ] && exit 3\n").unwrap();
         let port = TcpListenerFree::port();
         let d = tempfile::tempdir().unwrap();
         let l = Local::with(

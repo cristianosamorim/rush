@@ -31,6 +31,74 @@ pub const REAL_HOME_ENV: &str = "RUSH_TEST_REAL_HOME";
 /// git and sh but nothing a user installed.
 pub const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
+/// Writes a test program and publishes it only after all writable handles
+/// have closed, including ones a concurrent fork inherited. A plain write
+/// followed by spawn can otherwise fail with ETXTBSY on Linux
+/// (rust-lang/rust#114554). For test fixtures only.
+pub fn write_executable(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    write_executable_with_mode(path, body, 0o755)
+}
+
+/// Writes an executable fixture with the requested Unix permission bits.
+pub fn write_executable_with_mode(path: &Path, body: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    publish_executable(path, std::fs::Permissions::from_mode(mode), |out| {
+        out.write_all(body)
+    })
+}
+
+/// Copies a test binary with the same fork-safe publication as
+/// [`write_executable`], streaming its bytes and keeping its permissions.
+pub fn copy_executable(from: &Path, to: &Path) -> std::io::Result<u64> {
+    let mut input = std::fs::File::open(from)?;
+    let permissions = input.metadata()?.permissions();
+    publish_executable(to, permissions, |out| std::io::copy(&mut input, out))
+}
+
+fn publish_executable<T>(
+    path: &Path,
+    permissions: std::fs::Permissions,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("test executable needs a file name"))?;
+    let mut staged = OsString::from(".");
+    staged.push(name);
+    staged.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let staged = path.with_file_name(staged);
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&staged)?;
+    let result: std::io::Result<T> = (|| {
+        out.lock()?;
+        let value = write(&mut out)?;
+        out.set_permissions(permissions)?;
+        drop(out);
+        // flock belongs to the open-file description shared with forked
+        // children. A new read-only description waits for every inherited
+        // writer to close before this inode becomes executable by its name.
+        let ready = std::fs::File::open(&staged)?;
+        ready.lock_shared()?;
+        std::fs::rename(&staged, path)?;
+        Ok(value)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(staged);
+    }
+    result
+}
+
 /// Variables a test keeps although they start with RUSH_ or AGTOP_: they
 /// say what to test, not where a live rush is.
 const KEEP: &[&str] = &[

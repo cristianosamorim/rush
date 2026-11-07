@@ -252,7 +252,7 @@ fn loads_jobs_sessions_and_past() {
     // program moments after it starts, so the test failed whenever it ran
     // slower than that.
     let fake = d.0.join("claude");
-    std::fs::copy(std::env::current_exe().unwrap(), &fake).unwrap();
+    rush_testenv::copy_executable(&std::env::current_exe().unwrap(), &fake).unwrap();
     let mut worker = std::process::Command::new(&fake)
         .args(["tests::stand_in", "--exact", "--quiet"])
         .env(STAND_IN, "1")

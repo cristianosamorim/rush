@@ -601,9 +601,7 @@ esac
 "#
             );
             let p = dir.path().join("tailscale");
-            std::fs::write(&p, script).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            rush_testenv::write_executable(&p, script.as_bytes()).unwrap();
             Fake { dir }
         }
         fn bin(&self) -> PathBuf {

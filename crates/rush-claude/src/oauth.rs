@@ -838,7 +838,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("claude");
         // A copy, not a link: the listed name is the file run, not the link.
-        std::fs::copy("/usr/bin/true", &bin).unwrap();
+        rush_testenv::copy_executable(Path::new("/usr/bin/true"), &bin).unwrap();
         let mut child = std::process::Command::new(&bin).spawn().unwrap();
         let pid = child.id() as i32;
         while !rush_sys::proc::zombie(pid) {

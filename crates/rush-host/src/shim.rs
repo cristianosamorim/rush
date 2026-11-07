@@ -250,7 +250,7 @@ mod tests {
             std::fs::create_dir_all(d).unwrap();
         }
         let write = |p: &Path, body: &str| {
-            write_mode(p, format!("#!/bin/sh\n{body}").as_bytes(), 0o755).unwrap()
+            rush_testenv::write_executable(p, format!("#!/bin/sh\n{body}").as_bytes()).unwrap()
         };
         write(&bin.join("codex"), "echo \"real $*\"\n");
         let rush = cache.join("rush");

@@ -498,7 +498,6 @@ mod tests {
     /// each request it's sent with the next line of fixture, keeping the
     /// requests in log (Go's fakeProgram).
     fn fake_program(dir: &Path, name: &str, args: &str, fixture: &Path, log: &Path) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let script = format!(
             r#"#!/bin/sh
 [ "$*" = "{args}" ] || {{ echo "run with: $*" >&2; exit 2; }}
@@ -513,8 +512,7 @@ cat > /dev/null
             fixture.display()
         );
         let p = dir.join(name);
-        std::fs::write(&p, script).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        rush_testenv::write_executable(&p, script.as_bytes()).unwrap();
         p.to_string_lossy().into_owned()
     }
 

@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -135,12 +134,12 @@ fn ts_over_a_language_server() {
         .join("tsrs");
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     let exe = std::env::current_exe().unwrap();
-    std::fs::write(
+    rush_testenv::write_executable_with_mode(
         &bin,
-        format!("#!/bin/sh\nexec '{}' fake-lsp \"$@\"\n", exe.display()),
+        format!("#!/bin/sh\nexec '{}' fake-lsp \"$@\"\n", exe.display()).as_bytes(),
+        0o700,
     )
     .unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(root.join("tsconfig.json"), "{}").unwrap();
     let a = root.join("a.ts");
     std::fs::write(&a, "export const thing = 1;\nconst s = \"😀\"; thing;\n").unwrap();

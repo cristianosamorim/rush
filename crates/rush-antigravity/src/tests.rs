@@ -86,9 +86,7 @@ fn persistent_turns_and_saved_history() {
     let bin_dir = tempfile::tempdir().unwrap();
     rush_state::set_thread_dir(Some(home.path().to_path_buf()));
     let bin = bin_dir.path().join("agy");
-    std::fs::write(&bin, SCRIPT).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    rush_testenv::write_executable_with_mode(&bin, SCRIPT.as_bytes(), 0o700).unwrap();
 
     let (tx, rx) = mpsc::channel();
     let c = Antigravity::new()
@@ -210,13 +208,12 @@ fn exit_mid_turn_is_an_error() {
     let home = tempfile::tempdir().unwrap();
     rush_state::set_thread_dir(Some(home.path().to_path_buf()));
     let bin = home.path().join("agy");
-    std::fs::write(
+    rush_testenv::write_executable_with_mode(
         &bin,
-        "#!/bin/sh\nread -r x\necho 'out of quota' >&2\nexit 3\n",
+        b"#!/bin/sh\nread -r x\necho 'out of quota' >&2\nexit 3\n",
+        0o700,
     )
     .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (tx, rx) = mpsc::channel();
     let c = Antigravity::new()
         .start(

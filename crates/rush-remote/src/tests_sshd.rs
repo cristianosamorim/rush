@@ -70,9 +70,7 @@ impl Client {
             .unwrap();
         assert!(st.success());
         let ask = dir.join("ask");
-        std::fs::write(&ask, "#!/bin/sh\ncat \"$RUSH_TEST_CODE\"\n").unwrap();
-        std::fs::set_permissions(&ask, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        rush_testenv::write_executable(&ask, b"#!/bin/sh\ncat \"$RUSH_TEST_CODE\"\n").unwrap();
         Client {
             dir: dir.to_path_buf(),
             key,
@@ -207,12 +205,11 @@ impl Drop for Shell {
 /// echoes what's typed.
 fn fake_rush(dir: &Path) -> PathBuf {
     let exe = dir.join("rush");
-    std::fs::write(
+    rush_testenv::write_executable(
         &exe,
-        "#!/bin/sh\nprintf '\\033[?1049h'\necho \"ready $$\"\ntrap 'echo redraw' WINCH\nwhile :; do read l && echo \"got $l\"; done\n",
+        b"#!/bin/sh\nprintf '\\033[?1049h'\necho \"ready $$\"\ntrap 'echo redraw' WINCH\nwhile :; do read l && echo \"got $l\"; done\n",
     )
     .unwrap();
-    std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     exe
 }
 

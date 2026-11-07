@@ -16,9 +16,7 @@ pub(crate) fn fake_claude(dir: &Path, body: &str) -> (PathBuf, PathBuf) {
         body.replace("$LOG", &l.to_string())
     );
     let bin = dir.join("claude");
-    std::fs::write(&bin, script).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    rush_testenv::write_executable(&bin, script.as_bytes()).unwrap();
     (bin, log)
 }
 

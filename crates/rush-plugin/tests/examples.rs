@@ -92,7 +92,7 @@ fn cargo_build(pkg: &str, bin: &str, out: &Path) {
         "cargo build -p {pkg}: {}",
         String::from_utf8_lossy(&o.stderr)
     );
-    std::fs::copy(target.join("debug").join(bin), out).unwrap();
+    rush_testenv::copy_executable(&target.join("debug").join(bin), out).unwrap();
 }
 
 /// Installs the example plugin name into the test's rush folder: its
