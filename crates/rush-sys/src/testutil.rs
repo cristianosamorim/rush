@@ -63,7 +63,7 @@ pub fn gone_within(pid: i32, d: Duration) -> bool {
             let mut out: libc::kevent = std::mem::zeroed();
             let n = libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, &ts);
             libc::close(kq);
-            n > 0
+            return n > 0;
         }
     }
     #[cfg(target_os = "linux")]

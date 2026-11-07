@@ -281,10 +281,12 @@ mod os {
 mod tests {
     use super::*;
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     use std::io::{Read, Write};
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    use std::process::{Command, Stdio};
+    use std::process::Command;
+    #[cfg(target_os = "linux")]
+    use std::process::Stdio;
     #[cfg(target_os = "linux")]
     use std::sync::{Arc, Barrier, Condvar, Mutex};
 
@@ -300,12 +302,200 @@ mod tests {
         assert_eq!(parse_vm_stat("nonsense"), None);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn renice_changes_a_child_process() {
+        let mut child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let pid = child.id() as i32;
+        let before = priority(pid).unwrap();
+        if before < 19 {
+            renice(pid, before + 1);
+            let after = priority(pid).unwrap();
+            assert!(after > before, "child stayed at nice {before}, now {after}");
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn parses_meminfo() {
         let input = "MemTotal:       1024 kB\nMemAvailable:    256 kB\n";
         assert_eq!(parse_meminfo(input), Some((256 * 1024, 1024 * 1024)));
         assert_eq!(parse_meminfo("MemTotal: 1 kB"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn task_nice(pid: i32, tid: i32) -> Option<i32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")).ok()?;
+        let close = stat.rfind(')')?;
+        stat.get(close + 2..)?
+            .split_whitespace()
+            .nth(16)?
+            .parse()
+            .ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn all_task_nice(pid: i32) -> Vec<(i32, i32)> {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            return Vec::new();
+        };
+        let mut out: Vec<_> = tasks
+            .flatten()
+            .filter_map(|task| {
+                let tid = task.file_name().to_string_lossy().parse().ok()?;
+                Some((tid, task_nice(pid, tid)?))
+            })
+            .collect();
+        out.sort_unstable_by_key(|(tid, _)| *tid);
+        out
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_task_nice(pid: i32, tid: i32) -> Option<i32> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(nice) = task_nice(pid, tid) {
+                return Some(nice);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    // A child-only test entry point.  The parent test starts this test binary
+    // with the environment marker, then renices it while these worker threads
+    // are held alive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn renice_child_helper() {
+        if std::env::var_os("RUSH_GATE_RENICE_HELPER").is_none() {
+            return;
+        }
+        let Some(ready) = std::env::var_os("RUSH_GATE_RENICE_READY") else {
+            return;
+        };
+        let ready = std::path::PathBuf::from(ready);
+        let barrier = Arc::new(Barrier::new(3));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let tids = Arc::new(Mutex::new(Vec::new()));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let barrier = barrier.clone();
+            let release = release.clone();
+            let tids = tids.clone();
+            workers.push(std::thread::spawn(move || {
+                // SAFETY: gettid takes no pointers and returns this thread's
+                // stable kernel id.
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+                tids.lock().unwrap().push(tid);
+                barrier.wait();
+                let (lock, wake) = &*release;
+                let mut done = lock.lock().unwrap();
+                while !*done {
+                    done = wake.wait(done).unwrap();
+                }
+            }));
+        }
+        barrier.wait();
+        let tids = tids.lock().unwrap();
+        let ids = tids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let ready_tmp = ready.with_extension("tmp");
+        std::fs::write(&ready_tmp, ids).unwrap();
+        std::fs::rename(ready_tmp, ready).unwrap();
+        drop(tids);
+
+        let mut byte = [0u8; 1];
+        std::io::stdin().read_exact(&mut byte).unwrap();
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn renice_changes_all_child_threads_without_touching_another_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("renice_child_helper")
+            .env("RUSH_GATE_RENICE_HELPER", "1")
+            .env("RUSH_GATE_RENICE_READY", &ready)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let child_pid = child.id() as i32;
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::yield_now();
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("renice helper did not become ready");
+        }
+        let worker_tids: Vec<i32> = std::fs::read_to_string(&ready)
+            .unwrap()
+            .split(',')
+            .filter_map(|tid| tid.parse().ok())
+            .collect();
+        let before = all_task_nice(child_pid);
+
+        let mut unrelated = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let unrelated_pid = unrelated.id() as i32;
+        let unrelated_before = wait_task_nice(unrelated_pid, unrelated_pid);
+        let target = before
+            .iter()
+            .map(|(_, nice)| *nice)
+            .min()
+            .and_then(|nice| (nice < 19).then_some(nice + 1));
+        let Some(target) = target else {
+            let _ = child.stdin.take().unwrap().write_all(b"x");
+            let _ = child.wait();
+            let _ = unrelated.kill();
+            let _ = unrelated.wait();
+            return;
+        };
+
+        renice(child_pid, target);
+        let after = all_task_nice(child_pid);
+        let workers_raised = !worker_tids.is_empty()
+            && worker_tids
+                .iter()
+                .all(|tid| task_nice(child_pid, *tid).is_some_and(|nice| nice >= target));
+        let all_raised = !after.is_empty() && after.iter().all(|(_, nice)| *nice >= target);
+        let unrelated_after = wait_task_nice(unrelated_pid, unrelated_pid);
+
+        let _ = child.stdin.take().unwrap().write_all(b"x");
+        let child_status = child.wait().unwrap();
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+
+        assert!(
+            child_status.success(),
+            "renice helper failed: {child_status}"
+        );
+        assert!(workers_raised, "worker thread priorities were not raised");
+        assert!(all_raised, "not every child thread was reniced: {after:?}");
+        assert_eq!(unrelated_after, unrelated_before);
     }
 
     #[test]

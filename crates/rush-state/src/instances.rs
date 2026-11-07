@@ -154,7 +154,7 @@ pub fn proc_args(pid: i32) -> Vec<Vec<u8>> {
         // procfs terminates the vector with one NUL. Strip only that
         // terminator so empty argv entries between NULs are preserved.
         let end = b.len() - usize::from(b.last() == Some(&0));
-        return b[..end].split(|c| *c == 0).map(Vec::from).collect();
+        b[..end].split(|c| *c == 0).map(Vec::from).collect()
     }
 
     #[cfg(not(target_os = "linux"))]
