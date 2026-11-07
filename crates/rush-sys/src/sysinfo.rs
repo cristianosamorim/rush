@@ -176,7 +176,7 @@ pub fn read_battery() -> Battery {
 pub fn read_battery_pmset() -> Battery {
     #[cfg(not(target_os = "macos"))]
     {
-        return Battery::default();
+        Battery::default()
     }
     #[cfg(target_os = "macos")]
     {

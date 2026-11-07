@@ -41,6 +41,19 @@ builds the executable after formatting, Clippy and workspace tests pass.
 Each successful run publishes a `rush-linux-x86_64` artifact. These
 artifacts are temporary CI builds, not a stable Linux release.
 
+Download the artifact from a successful run while signed in to GitHub,
+then unzip it. In the extracted folder, verify and install the binary:
+
+```sh
+sha256sum -c rush-linux-x86_64.tar.gz.sha256
+tar -xzf rush-linux-x86_64.tar.gz
+install -Dm755 rush "$HOME/.local/bin/rush"
+```
+
+Ensure `~/.local/bin` is on `PATH`, then run `rush`. The binary targets
+Ubuntu 24.04; older distributions with an older glibc may need a source
+build on that distribution instead.
+
 ## Platform differences
 
 - The terminal UI, session hosts, provider adapters and bundled plugins

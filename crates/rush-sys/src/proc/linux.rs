@@ -115,7 +115,7 @@ fn ticks_per_second() -> u64 {
     *HZ.get_or_init(|| {
         // SAFETY: sysconf reads a process-wide constant and takes no pointers.
         let n = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-        (n > 0).then_some(n as u64).unwrap_or(100)
+        if n > 0 { n as u64 } else { 100 }
     })
 }
 
@@ -123,7 +123,7 @@ fn page_size() -> u64 {
     *PAGE.get_or_init(|| {
         // SAFETY: sysconf reads a process-wide constant and takes no pointers.
         let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        (n > 0).then_some(n as u64).unwrap_or(4096)
+        if n > 0 { n as u64 } else { 4096 }
     })
 }
 

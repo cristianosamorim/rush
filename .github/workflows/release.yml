@@ -1,6 +1,6 @@
 name: Release
 
-# Builds rush (the `rush` crate) for Macs with Apple silicon only, and
+# Builds rush (the `rush` crate) for Apple silicon Macs and GNU/Linux x86_64, and
 # publishes it: a rolling `nightly` prerelease every night main changed (or
 # by hand), and on a v* tag a GitHub release plus the Homebrew formula in
 # 0xdeafcafe/homebrew-tap (brew install 0xdeafcafe/tap/rush).

@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn linux_proc_counters_parse_receive_and_transmit_bytes() {
         let text = "eth0: 12 1 0 0 0 0 0 0 34 2 0 0 0 0 0 0\nlo: 99 1 0 0 0 0 0 0 88 2 0 0 0 0 0 0\nveth0: 77 1 0 0 0 0 0 0 66 2 0 0 0 0 0 0\nbad0: x 1 0\n";
-        let got = parse_proc_net_dev(text, |name| (name == "eth0").then_some(7).unwrap_or(0));
+        let got = parse_proc_net_dev(text, |name| if name == "eth0" { 7 } else { 0 });
         assert_eq!(got, HashMap::from([(7, [12, 34])]))
     }
 }
