@@ -46,6 +46,12 @@ jobs:
             --skip shimmers_on_his_second \
             --skip stuck_shell_is_stopped \
             --skip compacts_only_the_conversation_expected
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Go digest reference
+        run: go run tools/linux-digest/main.go
       - name: Build
         run: cargo build --release --locked -p rush
       - name: Smoke test

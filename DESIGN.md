@@ -128,6 +128,9 @@ Wayland's `wl-paste` or X11's `xclip`. The remote HTTP server remains
 portable; installing its LaunchAgent does not. Global input idle time
 and screen lock status remain unavailable, so the existing away guard
 falls back to inactivity inside Rush on Linux.
+Linux cleanup also treats equal path/session birth timestamps as uncertain
+ownership and keeps the path; coarse filesystem timestamps must not make a
+pre-existing path eligible for automatic removal.
 
 Installed plugins must keep the sandbox contract: Linux support must
 never turn a missing macOS sandbox into unsandboxed execution. The
@@ -137,7 +140,9 @@ Tests still run on GitHub CI. The test-home constructor uses Mach-O's
 `__mod_init_func` on macOS and ELF's `.init_array` on Linux, before any
 test thread starts. The Linux workflow runs formatting, Clippy across
 all targets, workspace tests, a release build and command-line smoke
-checks, then retains the resulting executable. macOS-only benchmarks
+checks, then retains the resulting executable. The plugin approval digest
+also runs against the Go reference for Linux's symlink modes. macOS-only
+benchmarks
 and native helper tests are gated at the platform boundary. No Linux
 performance or real-provider compatibility claim is implied by the port.
 
