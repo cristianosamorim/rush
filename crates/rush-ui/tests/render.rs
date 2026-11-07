@@ -805,8 +805,14 @@ fn snapshot_projects() {
 
 #[test]
 fn snapshot_settings_general() {
+    // Linux has one fewer setting: the Apple menu bar helper is absent.
+    let name = if cfg!(target_os = "linux") {
+        "snap_settings_general_linux"
+    } else {
+        "snap_settings_general"
+    };
     views(
-        "snap_settings_general",
+        name,
         |m| {
             rush_ui::screens::settings::set_settings_page(
                 m,
