@@ -7,14 +7,29 @@ use std::time::Duration;
 
 /// How long since the last key or mouse anywhere on the machine.
 pub fn since_input() -> Option<Duration> {
-    mac::hid_idle()
+    #[cfg(target_os = "macos")]
+    {
+        mac::hid_idle()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 /// Whether the screen is locked.
 pub fn screen_locked() -> Option<bool> {
-    Some(mac::locked())
+    #[cfg(target_os = "macos")]
+    {
+        Some(mac::locked())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
+#[cfg(target_os = "macos")]
 mod mac {
     use std::ffi::{c_char, c_void};
     use std::time::Duration;

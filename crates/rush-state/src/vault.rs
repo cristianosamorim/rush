@@ -102,7 +102,9 @@ fn service_of(dir: &Path) -> String {
 /// home's own (see [`service_for`]).
 pub fn vault() -> Keys {
     let dir = crate::dir();
-    let service = Some(service_of(&dir));
+    // Unit tests retain the in-process keychain fake on every host; a real
+    // Linux run uses the private files store rather than macOS security(1).
+    let service = (cfg!(target_os = "macos") || cfg!(test)).then(|| service_of(&dir));
     Keys {
         dir: dir.join("logins"),
         service,
@@ -272,6 +274,12 @@ pub mod keychain {
         io::Error::new(io::ErrorKind::NotFound, "keychain: no such item")
     }
 
+    /// The real command exists only on macOS. Tests keep using the fake map
+    /// on every host so keychain isolation remains deterministic.
+    fn available() -> bool {
+        cfg!(target_os = "macos") || rush_core::sandbox::active()
+    }
+
     type Items = std::collections::BTreeMap<(String, String), Vec<u8>>;
 
     /// In a test (rush_core::sandbox), the keychain is this process's map
@@ -298,6 +306,9 @@ pub mod keychain {
             return fake_find(&f, service, account)
                 .map(|(_, v)| v.clone())
                 .ok_or_else(not_found);
+        }
+        if !available() {
+            return Err(not_found());
         }
         let mut args = vec!["find-generic-password", "-s", service, "-w"];
         if !account.is_empty() {
@@ -347,6 +358,9 @@ pub mod keychain {
         if let Some(f) = fake() {
             return f.contains_key(&(service.to_string(), account.to_string()));
         }
+        if !available() {
+            return false;
+        }
         Command::new(SECURITY)
             .args(["find-generic-password", "-s", service, "-a", account])
             .stdout(Stdio::null())
@@ -363,6 +377,12 @@ pub mod keychain {
         if let Some(mut f) = fake() {
             f.insert((service.to_string(), account.to_string()), secret.to_vec());
             return Ok(());
+        }
+        if !available() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "keychain is only available on macOS",
+            ));
         }
         let hex = to_hex(secret);
         let line = format!(
@@ -420,6 +440,9 @@ pub mod keychain {
                 .ok_or_else(not_found)?;
             f.remove(&k);
             return Ok(());
+        }
+        if !available() {
+            return Err(not_found());
         }
         let mut args = vec!["delete-generic-password", "-s", service];
         if !account.is_empty() {
@@ -510,6 +533,11 @@ mod tests {
         v.put("a", b"secret").unwrap();
         assert_eq!(v.get("a").unwrap(), b"secret");
         use std::os::unix::fs::PermissionsExt;
+        let dir_mode = fs::metadata(d.path().join("logins"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
         let mode = fs::metadata(d.path().join("logins/a.json"))
             .unwrap()
             .permissions()

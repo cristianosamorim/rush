@@ -68,8 +68,14 @@ pub fn parse_vm_stat(s: &str) -> Option<u64> {
 /// from one that failed.
 fn clear_errno() {
     // SAFETY: errno is this thread's own.
+    #[cfg(target_os = "macos")]
     unsafe {
         *libc::__error() = 0;
+    }
+    // SAFETY: errno is this thread's own.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        *libc::__errno_location() = 0;
     }
 }
 
@@ -89,6 +95,7 @@ fn priority(pid: i32) -> Option<i32> {
     Some(p)
 }
 
+#[cfg(target_os = "macos")]
 mod os {
     use std::ffi::CString;
 
@@ -160,11 +167,129 @@ mod os {
     }
 }
 
+/// Parses Linux's `/proc/meminfo` values.  The kernel reports the fields in
+/// KiB today, but accepting the other documented units keeps this parser
+/// correct for procfs implementations which choose to spell them out.
+#[cfg(target_os = "linux")]
+pub fn parse_meminfo(s: &str) -> Option<(u64, u64)> {
+    let mut total = None;
+    let mut available = None;
+    for line in s.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if !matches!(name, "MemTotal" | "MemAvailable") {
+            continue;
+        }
+        let mut value = value.split_whitespace();
+        let Some(n) = value.next().and_then(|n| n.parse::<u64>().ok()) else {
+            continue;
+        };
+        let multiplier = match value.next().unwrap_or("kB") {
+            "kB" => 1024,
+            "MB" => 1024 * 1024,
+            "GB" => 1024 * 1024 * 1024,
+            "B" => 1,
+            _ => continue,
+        };
+        let Some(bytes) = n.checked_mul(multiplier) else {
+            continue;
+        };
+        match name.trim() {
+            "MemTotal" => total = Some(bytes),
+            "MemAvailable" => available = Some(bytes),
+            _ => {}
+        }
+    }
+    Some((available?, total?))
+}
+
+#[cfg(target_os = "linux")]
+mod os {
+    /// What `/proc/meminfo` says is available and in all, in bytes.
+    pub fn memory() -> (u64, u64) {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| super::parse_meminfo(&s))
+            .unwrap_or((0, 0))
+    }
+
+    /// Linux has no single pressure level matching Darwin's VM pressure
+    /// sysctl.  The caller treats zero as unknown; memory_level still gives
+    /// the useful `/proc/meminfo` availability share.
+    pub fn pressure() -> i32 {
+        0
+    }
+
+    pub fn mem_level() -> i32 {
+        let (available, total) = memory();
+        if total == 0 {
+            return -1;
+        }
+        ((available as u128 * 100 / total as u128).min(100)) as i32
+    }
+
+    pub fn renice(pid: i32, n: i32) {
+        // Linux keeps nice per thread, so include the agent's worker
+        // threads. libc::getpriority already translates the raw syscall
+        // result to the conventional -20..19 nice value.
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            return;
+        };
+        for task in tasks.flatten() {
+            let Ok(tid) = task.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            if super::priority(tid).is_some_and(|cur| cur >= n) {
+                continue;
+            }
+            // SAFETY: setpriority takes plain integers.
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, n);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod os {
+    pub fn memory() -> (u64, u64) {
+        (0, 0)
+    }
+
+    pub fn pressure() -> i32 {
+        0
+    }
+
+    pub fn mem_level() -> i32 {
+        -1
+    }
+
+    pub fn renice(pid: i32, n: i32) {
+        if super::priority(pid).is_some_and(|cur| cur >= n) {
+            return;
+        }
+        // SAFETY: setpriority takes plain integers.
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, n);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::io::{Read, Write};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::process::{Command, Stdio};
+    #[cfg(target_os = "linux")]
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
+
     // sys_darwin_test.go TestParseVMStat
+    #[cfg(target_os = "macos")]
     #[test]
     fn parses_vm_stat() {
         let out = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
@@ -173,6 +298,14 @@ mod tests {
             Pages purgeable:                                 3.\n";
         assert_eq!(parse_vm_stat(out), Some(123 * 16384));
         assert_eq!(parse_vm_stat("nonsense"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_meminfo() {
+        let input = "MemTotal:       1024 kB\nMemAvailable:    256 kB\n";
+        assert_eq!(parse_meminfo(input), Some((256 * 1024, 1024 * 1024)));
+        assert_eq!(parse_meminfo("MemTotal: 1 kB"), None);
     }
 
     #[test]

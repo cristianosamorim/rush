@@ -155,7 +155,8 @@ pub fn task_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The file stdout writes to, as fcntl's F_GETPATH says.
+/// The file stdout writes to, as the platform's descriptor path lookup says.
+#[cfg(target_os = "macos")]
 fn stdout_path() -> String {
     let mut buf = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most MAXPATHLEN bytes into buf.
@@ -164,6 +165,19 @@ fn stdout_path() -> String {
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn stdout_path() -> String {
+    std::fs::read_link("/proc/self/fd/1")
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn stdout_path() -> String {
+    String::new()
 }
 
 /// Keeps l for its task, replacing what was there whole.

@@ -18,7 +18,7 @@ brew install 0xdeafcafe/tap/rush
 rush
 ```
 
-Use the full name: homebrew/core has a different `rush` (GNU's restricted shell), and plain `brew install rush` gets you that one. Macs with Apple silicon only.
+Use the full name: homebrew/core has a different `rush` (GNU's restricted shell), and plain `brew install rush` gets you that one. Homebrew packages are for Macs with Apple silicon. This fork also adds an experimental [Linux and WSL2 port](docs/linux.md), installed from its `codex/linux-port` branch.
 
 ## Fast, on purpose
 

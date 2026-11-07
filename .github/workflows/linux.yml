@@ -39,6 +39,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
+        timeout-minutes: 20
         run: |
           cargo test --workspace --locked --no-fail-fast -- \
             --skip shimmers_on_his_second \
@@ -50,9 +51,20 @@ jobs:
         run: |
           target/release/rush --version
           target/release/rush --help
+          RUSH_HOME="$RUNNER_TEMP/rush-smoke" timeout 30s target/release/rush --render 120x40 > "$RUNNER_TEMP/rush-screen.txt"
+          test -s "$RUNNER_TEMP/rush-screen.txt"
+      - name: Package
+        run: |
+          mkdir -p dist/docs
+          cp target/release/rush LICENSE README.md dist/
+          cp docs/linux.md dist/docs/
+          tar -czf rush-linux-x86_64.tar.gz -C dist rush LICENSE README.md docs/linux.md
+          sha256sum rush-linux-x86_64.tar.gz > rush-linux-x86_64.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: rush-linux-x86_64
-          path: target/release/rush
+          path: |
+            rush-linux-x86_64.tar.gz
+            rush-linux-x86_64.tar.gz.sha256
           retention-days: 14
           if-no-files-found: error

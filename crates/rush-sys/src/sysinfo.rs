@@ -157,22 +157,41 @@ pub fn read_disk() -> Disk {
 /// present with an internal battery, its charge, and charging while the
 /// power comes from AC.
 pub fn read_battery() -> Battery {
-    ps::read().unwrap_or_default()
+    #[cfg(target_os = "macos")]
+    {
+        ps::read().unwrap_or_default()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_battery()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Battery::default()
+    }
 }
 
 /// The battery, from `pmset -g batt`: what [`read_battery`] reads,
 /// the way Go does, to check it against.
 pub fn read_battery_pmset() -> Battery {
-    match crate::cmd::output_within(
-        std::process::Command::new("/usr/bin/pmset").args(["-g", "batt"]),
-        Duration::from_secs(2),
-    ) {
-        Ok(o) if o.ok() => parse_pmset(&String::from_utf8_lossy(&o.out)),
-        _ => Battery::default(),
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Battery::default();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match crate::cmd::output_within(
+            std::process::Command::new("/usr/bin/pmset").args(["-g", "batt"]),
+            Duration::from_secs(2),
+        ) {
+            Ok(o) if o.ok() => parse_pmset(&String::from_utf8_lossy(&o.out)),
+            _ => Battery::default(),
+        }
     }
 }
 
 /// IOKit's power sources (IOPowerSources.h), as pmset reads them.
+#[cfg(target_os = "macos")]
 mod ps {
     use std::ffi::{c_char, c_void};
 
@@ -273,6 +292,50 @@ mod ps {
     }
 }
 
+/// Linux power supplies expose the same three values through sysfs. A
+/// desktop has no `type=Battery` entry and therefore returns the neutral
+/// reading. AC state is read separately because a full battery is still
+/// plugged in even while it is no longer accepting charge.
+#[cfg(target_os = "linux")]
+fn linux_battery() -> Battery {
+    let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") else {
+        return Battery::default();
+    };
+    let mut percent = None;
+    let mut status = String::new();
+    let mut ac_online = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let kind = std::fs::read_to_string(path.join("type")).unwrap_or_default();
+        match kind.trim() {
+            "Battery" => {
+                if percent.is_none() {
+                    percent = std::fs::read_to_string(path.join("capacity"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok());
+                    status = std::fs::read_to_string(path.join("status"))
+                        .unwrap_or_default()
+                        .trim()
+                        .to_owned();
+                }
+            }
+            "Mains" | "USB" | "USB_C" | "Wireless" => {
+                ac_online |=
+                    std::fs::read_to_string(path.join("online")).is_ok_and(|s| s.trim() == "1");
+            }
+            _ => {}
+        }
+    }
+    let Some(percent) = percent else {
+        return Battery::default();
+    };
+    Battery {
+        present: true,
+        percent: percent.clamp(0, 100),
+        charging: ac_online || matches!(status.as_str(), "Charging" | "Full"),
+    }
+}
+
 /// Reads `pmset -g batt`: its first line says what power it's drawing
 /// from, the next the battery's charge.
 pub fn parse_pmset(out: &str) -> Battery {
@@ -306,6 +369,7 @@ mod tests {
     use super::*;
 
     // IOKit's reading is the one pmset prints (Go reads pmset).
+    #[cfg(target_os = "macos")]
     #[test]
     fn iokit_reads_as_pmset_does() {
         let (a, b) = (read_battery(), read_battery_pmset());

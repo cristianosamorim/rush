@@ -860,12 +860,12 @@ fn short_err(e: &std::io::Error) -> String {
     words.into()
 }
 
-/// How far a counter moved from was to is, allowing for one cut to 32 bits
-/// wrapping; a counter that went back otherwise was reset.
+/// How far a counter moved from was to is. Darwin counters can wrap at
+/// 32 bits; Linux provides 64-bit counters, whose decrease means reset.
 fn grew(was: u64, is: u64) -> u64 {
     if is >= was {
         is - was
-    } else if was < 1 << 32 {
+    } else if cfg!(target_os = "macos") && was < 1 << 32 {
         is + (1 << 32) - was
     } else {
         0
@@ -1001,7 +1001,10 @@ mod tests {
     #[test]
     fn grew_wraps() {
         assert_eq!(grew(10, 25), 15);
-        assert_eq!(grew((1 << 32) - 10, 5), 15);
+        assert_eq!(
+            grew((1 << 32) - 10, 5),
+            if cfg!(target_os = "macos") { 15 } else { 0 }
+        );
         assert_eq!(grew(1 << 40, 5), 0);
     }
 

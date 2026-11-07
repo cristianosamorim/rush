@@ -8,7 +8,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "rush/**"]
+    branches: [main, "rush/**", "codex/linux-port"]
     # The website builds in pages.yml; it doesn't need rush's tests.
     paths-ignore: ["site/**", ".github/workflows/pages.yml"]
   pull_request:

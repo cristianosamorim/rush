@@ -7,9 +7,14 @@
 //! and squeeze_other.go. The format is the system's (zlib blocks of 64 KB
 //! in the resource fork, type 4), the same as Go writes.
 
+#[cfg(target_os = "macos")]
 use std::fs::Metadata;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
+use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::SystemTime;
 
 /// What a pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -28,61 +33,70 @@ pub struct Pass {
 /// aren't compressed already. A file that fails any check is left exactly
 /// as it was.
 pub fn transcripts<P: AsRef<Path>>(dirs: &[P], idle: Duration) -> Pass {
-    let mut r = Pass::default();
-    let mut failed: Vec<String> = Vec::new(); // the first few, and why, for the log
-    let cutoff = SystemTime::now()
-        .checked_sub(idle)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    for dir in dirs {
-        // A folder that's a link isn't walked into, as Go's WalkDir doesn't:
-        // what it links to is another folder's, compressed from there.
-        if std::fs::symlink_metadata(dir.as_ref()).is_ok_and(|m| m.file_type().is_symlink()) {
-            continue;
-        }
-        walk(dir.as_ref(), &mut |p| {
-            if !p.to_string_lossy().ends_with(".jsonl") {
-                return;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (dirs, idle);
+        return Pass::default();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut r = Pass::default();
+        let mut failed: Vec<String> = Vec::new(); // the first few, and why, for the log
+        let cutoff = SystemTime::now()
+            .checked_sub(idle)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        for dir in dirs {
+            // A folder that's a link isn't walked into, as Go's WalkDir doesn't:
+            // what it links to is another folder's, compressed from there.
+            if std::fs::symlink_metadata(dir.as_ref()).is_ok_and(|m| m.file_type().is_symlink()) {
+                continue;
             }
-            let Ok(info) = std::fs::symlink_metadata(p) else {
-                return;
-            };
-            let old = info.modified().is_ok_and(|m| m <= cutoff);
-            if info.len() < 64 << 10 || !old || compressed(&info) {
-                return;
-            }
-            let before = disk_use(&info);
-            if rush_core::dryrun::would(
-                "compress-transcript",
-                &p.to_string_lossy(),
-                "a transcript untouched for two days, stored compressed (it reads the same)",
-            ) {
-                return;
-            }
-            if let Err(e) = file(p) {
-                r.failed += 1;
-                if failed.len() < 5 {
-                    failed.push(format!("{}: {e}", p.display()));
+            walk(dir.as_ref(), &mut |p| {
+                if !p.to_string_lossy().ends_with(".jsonl") {
+                    return;
                 }
-                return;
-            }
-            r.files += 1;
-            r.before += before;
-            if let Ok(st) = std::fs::metadata(p) {
-                r.after += disk_use(&st);
-            }
-        });
+                let Ok(info) = std::fs::symlink_metadata(p) else {
+                    return;
+                };
+                let old = info.modified().is_ok_and(|m| m <= cutoff);
+                if info.len() < 64 << 10 || !old || compressed(&info) {
+                    return;
+                }
+                let before = disk_use(&info);
+                if rush_core::dryrun::would(
+                    "compress-transcript",
+                    &p.to_string_lossy(),
+                    "a transcript untouched for two days, stored compressed (it reads the same)",
+                ) {
+                    return;
+                }
+                if let Err(e) = file(p) {
+                    r.failed += 1;
+                    if failed.len() < 5 {
+                        failed.push(format!("{}: {e}", p.display()));
+                    }
+                    return;
+                }
+                r.files += 1;
+                r.before += before;
+                if let Ok(st) = std::fs::metadata(p) {
+                    r.after += disk_use(&st);
+                }
+            });
+        }
+        if r.failed > 0 {
+            crate::events::log(
+                "squeeze-failed",
+                serde_json::json!({"failed": r.failed, "compressed": r.files, "errs": failed}),
+            );
+        }
+        r
     }
-    if r.failed > 0 {
-        crate::events::log(
-            "squeeze-failed",
-            serde_json::json!({"failed": r.failed, "compressed": r.files, "errs": failed}),
-        );
-    }
-    r
 }
 
 /// Every file under dir, in lexical order, as Go's filepath.WalkDir:
 /// links aren't followed into, and unreadable folders are passed by.
+#[cfg(target_os = "macos")]
 fn walk(dir: &Path, f: &mut dyn FnMut(&Path)) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -101,13 +115,40 @@ fn walk(dir: &Path, f: &mut dyn FnMut(&Path)) {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub use darwin::{compressed, encode, file};
 
+#[cfg(not(target_os = "macos"))]
+mod other {
+    use std::fs::Metadata;
+    use std::path::Path;
+
+    pub fn compressed(_info: &Metadata) -> bool {
+        false
+    }
+
+    pub fn encode(_data: &[u8]) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "filesystem compression is only available on macOS",
+        ))
+    }
+
+    pub fn file(_path: &Path) -> Result<(), String> {
+        Err("filesystem compression is only available on macOS".into())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub use other::{compressed, encode, file};
+
+#[cfg(target_os = "macos")]
 fn disk_use(info: &Metadata) -> i64 {
     use std::os::unix::fs::MetadataExt;
     info.blocks() as i64 * 512
 }
 
+#[cfg(target_os = "macos")]
 mod darwin {
     use std::ffi::CString;
     use std::fs::Metadata;
@@ -267,7 +308,7 @@ mod darwin {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -279,6 +320,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn compresses_idle_transcripts() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.jsonl");
@@ -338,6 +380,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn incompressible_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("r.jsonl");
@@ -358,6 +401,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn encode_layout() {
         let data = vec![b'a'; BLOCK_TEST + 10];
         let (header, fork) = encode(&data).unwrap();

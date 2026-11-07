@@ -9,8 +9,14 @@ use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "macos")]
 mod darwin;
+#[cfg(target_os = "macos")]
 use darwin as os;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as os;
 
 mod sampler;
 pub use sampler::{Sampler, Usage};
@@ -269,6 +275,32 @@ pub fn fd_file(pid: Pid, fd: i32) -> Option<std::path::PathBuf> {
         return None;
     }
     os::fd_file(pid, fd)
+}
+
+/// The directory a process has as its current working directory, when the
+/// kernel lets us read it. Linux exposes this through `/proc/<pid>/cwd`.
+#[cfg(target_os = "linux")]
+pub fn cwd(pid: Pid) -> Option<std::path::PathBuf> {
+    if demo().is_some() || pid <= 0 {
+        return None;
+    }
+    os::cwd(pid)
+}
+
+/// The regular files a process has open, as `(fd, path)` pairs. Descriptors
+/// that point to pipes, sockets, terminals or devices are omitted.
+#[cfg(target_os = "linux")]
+pub fn files(pid: Pid) -> Vec<(i32, std::path::PathBuf)> {
+    if demo().is_some() || pid <= 0 {
+        return Vec::new();
+    }
+    os::files(pid)
+}
+
+/// Alias for [`files`], named after Linux's `/proc/<pid>/fd` directory.
+#[cfg(target_os = "linux")]
+pub fn fds(pid: Pid) -> Vec<(i32, std::path::PathBuf)> {
+    files(pid)
 }
 
 /// A process's arguments, joined by spaces.

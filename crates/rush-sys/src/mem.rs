@@ -21,14 +21,31 @@ pub fn let_go<T: Send + 'static>(v: T) {
 
 /// Asks the allocator to return the pages it holds free.
 pub fn give_back() {
-    // SAFETY: a null zone asks every zone; it only returns free pages.
-    unsafe {
-        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: a null zone asks every zone; it only returns free pages.
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: malloc_trim(0) only releases pages that the allocator no
+        // longer needs; it does not invalidate live allocations.
+        unsafe {
+            malloc_trim(0);
+        }
     }
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: libc::size_t) -> libc::size_t;
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn malloc_trim(pad: libc::size_t) -> libc::c_int;
 }
 
 #[cfg(test)]

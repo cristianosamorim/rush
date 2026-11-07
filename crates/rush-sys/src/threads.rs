@@ -155,72 +155,104 @@ pub fn count() -> usize {
 
 /// How many threads process pid runs now; 0 when it can't be told.
 pub fn count_of(pid: i32) -> usize {
-    // SAFETY: zeroed is a valid proc_taskinfo; proc_pidinfo fills it.
-    let mut ti: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
-    // SAFETY: an out-buffer of the size given.
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTASKINFO,
-            0,
-            (&mut ti as *mut libc::proc_taskinfo).cast(),
-            size,
-        )
-    };
-    if n == size {
-        ti.pti_threadnum as usize
-    } else {
-        0
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: zeroed is a valid proc_taskinfo; proc_pidinfo fills it.
+        let mut ti: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        // SAFETY: an out-buffer of the size given.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTASKINFO,
+                0,
+                (&mut ti as *mut libc::proc_taskinfo).cast(),
+                size,
+            )
+        };
+        return if n == size {
+            ti.pti_threadnum as usize
+        } else {
+            0
+        };
     }
+    #[cfg(target_os = "linux")]
+    {
+        if pid <= 0 {
+            return 0;
+        }
+        return std::fs::read_dir(format!("/proc/{pid}/task"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+    }
+    #[allow(unreachable_code)]
+    0
 }
 
 /// proc_pidinfo's list of a process's threads (sys/proc_info.h), which
 /// libc doesn't name.
+#[cfg(target_os = "macos")]
 const PROC_PIDLISTTHREADS: libc::c_int = 6;
 
 /// The names of this process's threads now, an unnamed one as ""; empty
 /// when they can't be told. For a test to say which it didn't expect.
 pub fn names() -> Vec<String> {
-    let pid = std::process::id() as i32;
-    let mut ids = vec![0u64; count() + 16];
-    // SAFETY: an out-buffer of the size given.
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            PROC_PIDLISTTHREADS,
-            0,
-            ids.as_mut_ptr().cast(),
-            (ids.len() * 8) as libc::c_int,
-        )
-    };
-    if n <= 0 {
-        return Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let pid = std::process::id();
+        let mut out = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.flatten())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter_map(|tid| std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm")).ok())
+            .map(|name| name.trim_end_matches(['\r', '\n']).to_string())
+            .collect::<Vec<_>>();
+        out.sort_unstable();
+        return out;
     }
-    ids.truncate(n as usize / 8);
-    let size = std::mem::size_of::<libc::proc_threadinfo>() as libc::c_int;
-    ids.iter()
-        .filter_map(|&t| {
-            // SAFETY: zeroed is a valid proc_threadinfo; proc_pidinfo fills it.
-            let mut ti: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
-            // SAFETY: an out-buffer of the size given.
-            let r = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDTHREADINFO,
-                    t,
-                    (&mut ti as *mut libc::proc_threadinfo).cast(),
-                    size,
-                )
-            };
-            // SAFETY: pth_name is NUL-terminated within its array.
-            (r == size).then(|| {
-                unsafe { std::ffi::CStr::from_ptr(ti.pth_name.as_ptr()) }
-                    .to_string_lossy()
-                    .into_owned()
+    #[cfg(target_os = "macos")]
+    {
+        let pid = std::process::id() as i32;
+        let mut ids = vec![0u64; count() + 16];
+        // SAFETY: an out-buffer of the size given.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDLISTTHREADS,
+                0,
+                ids.as_mut_ptr().cast(),
+                (ids.len() * 8) as libc::c_int,
+            )
+        };
+        if n <= 0 {
+            return Vec::new();
+        }
+        ids.truncate(n as usize / 8);
+        let size = std::mem::size_of::<libc::proc_threadinfo>() as libc::c_int;
+        ids.iter()
+            .filter_map(|&t| {
+                // SAFETY: zeroed is a valid proc_threadinfo; proc_pidinfo fills it.
+                let mut ti: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+                // SAFETY: an out-buffer of the size given.
+                let r = unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        libc::PROC_PIDTHREADINFO,
+                        t,
+                        (&mut ti as *mut libc::proc_threadinfo).cast(),
+                        size,
+                    )
+                };
+                // SAFETY: pth_name is NUL-terminated within its array.
+                (r == size).then(|| {
+                    unsafe { std::ffi::CStr::from_ptr(ti.pth_name.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned()
+                })
             })
-        })
-        .collect()
+            .collect()
+    }
 }
 
 #[cfg(test)]

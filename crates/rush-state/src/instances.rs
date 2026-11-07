@@ -145,10 +145,26 @@ pub fn lock() -> Result<u32, i32> {
 /// A process's arguments; empty when they can't be read (another user's
 /// process, or none at pid).
 pub fn proc_args(pid: i32) -> Vec<Vec<u8>> {
-    darwin_args(pid)
+    #[cfg(target_os = "linux")]
+    {
+        let b = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        if b.is_empty() {
+            return Vec::new();
+        }
+        // procfs terminates the vector with one NUL. Strip only that
+        // terminator so empty argv entries between NULs are preserved.
+        let end = b.len() - usize::from(b.last() == Some(&0));
+        return b[..end].split(|c| *c == 0).map(Vec::from).collect();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        darwin_args(pid)
+    }
 }
 
 /// kern.procargs2: argc, the executable's path, padding, then argv.
+#[cfg(not(target_os = "linux"))]
 fn darwin_args(pid: i32) -> Vec<Vec<u8>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut size: libc::size_t = 0;
@@ -244,6 +260,19 @@ mod tests {
     // spawn returns once the child has exec'd, so its arguments are its own.
     fn sleep(secs: &str) -> Child {
         Child(Command::new("sleep").arg(secs).spawn().unwrap())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_args_keeps_empty_linux_arguments() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30", ""])
+            .spawn()
+            .unwrap();
+        let args = proc_args(child.id() as i32);
+        assert!(args.iter().any(|arg| arg.is_empty()), "arguments: {args:?}");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     fn list(pid: u32, args: &[&str]) -> PathBuf {

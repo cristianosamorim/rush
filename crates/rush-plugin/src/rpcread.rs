@@ -1,6 +1,6 @@
 //! One thread reads every JSON-RPC connection in the process (Rust-only:
 //! Go reads each connection in a goroutine, which costs far less than a
-//! thread). It waits in one kqueue on every connection's descriptor, reads
+//! thread). It waits in one kqueue (epoll on Linux) on every connection's descriptor, reads
 //! what's ready without blocking, cuts it into messages and hands each to
 //! its connection (`Conn::deliver`, rpc.rs). No handler runs on it: a
 //! slow one would hold up every other connection.
@@ -180,6 +180,13 @@ pub(crate) enum Why {
     Closed,
 }
 
+// Keep the reader's control operations platform-neutral. kqueue uses these
+// as event flags; Linux maps them to epoll_ctl operations below.
+const WATCH_ADD: u16 = 1;
+const WATCH_DELETE: u16 = 2;
+const WATCH_DISABLE: u16 = 3;
+const WATCH_ENABLE: u16 = 4;
+
 struct Entry {
     token: u64,
     fd: OwnedFd,
@@ -201,7 +208,7 @@ struct State {
 
 /// The process's one reader.
 pub(crate) struct Reader {
-    kq: OwnedFd,
+    wait: OwnedFd,
     conns: Mutex<HashMap<u64, Arc<Entry>>>,
     next: AtomicU64,
     /// Its wait failed: connections made from now read on threads.
@@ -213,7 +220,8 @@ static STARTED: OnceLock<bool> = OnceLock::new();
 
 impl Reader {
     /// The process's reader, started the first time it's asked for; None
-    /// when it can't be (no kqueue, no thread), or its wait has failed.
+    /// when it can't be (no kernel wait primitive, no thread), or its wait
+    /// has failed.
     pub(crate) fn get() -> Option<&'static Reader> {
         let r = READER.get_or_init(Reader::make).as_ref()?;
         let started = *STARTED.get_or_init(|| {
@@ -228,18 +236,9 @@ impl Reader {
     }
 
     fn make() -> Option<Reader> {
-        // SAFETY: kqueue takes nothing; a non-negative result is ours.
-        let kq = unsafe { libc::kqueue() };
-        if kq < 0 {
-            return None;
-        }
-        // SAFETY: kq is a descriptor we just made, ours to own.
-        let kq = unsafe {
-            libc::fcntl(kq, libc::F_SETFD, libc::FD_CLOEXEC);
-            OwnedFd::from_raw_fd(kq)
-        };
+        let wait = make_wait()?;
         Some(Reader {
-            kq,
+            wait,
             conns: Mutex::new(HashMap::new()),
             next: AtomicU64::new(0),
             broken: AtomicBool::new(false),
@@ -282,7 +281,7 @@ impl Reader {
             }),
         });
         lock(&self.conns).insert(token, e);
-        if self.ctl(raw, libc::EV_ADD, token).is_ok() {
+        if self.ctl(raw, WATCH_ADD, token).is_ok() {
             return Ok(());
         }
         // Never watched, so nothing else holds it.
@@ -293,17 +292,29 @@ impl Reader {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn ctl(&self, fd: RawFd, flags: u16, token: u64) -> io::Result<()> {
         // SAFETY: kevent is plain data.
         let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
         ev.ident = fd as usize;
         ev.filter = libc::EVFILT_READ;
-        ev.flags = flags;
+        ev.flags = match flags {
+            WATCH_ADD => libc::EV_ADD,
+            WATCH_DELETE => libc::EV_DELETE,
+            WATCH_DISABLE => libc::EV_DISABLE,
+            WATCH_ENABLE => libc::EV_ENABLE,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bad reader watch operation",
+                ));
+            }
+        };
         ev.udata = std::ptr::without_provenance_mut(token as usize);
         // SAFETY: one change from a valid kevent; no events asked for.
         let r = unsafe {
             libc::kevent(
-                self.kq.as_raw_fd(),
+                self.wait.as_raw_fd(),
                 &ev,
                 1,
                 std::ptr::null_mut(),
@@ -318,6 +329,55 @@ impl Reader {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn ctl(&self, fd: RawFd, flags: u16, token: u64) -> io::Result<()> {
+        // A disabled epoll registration is removed, then added again on
+        // resume. This matches kqueue's EV_DISABLE semantics without letting
+        // a hung-up descriptor wake the reader while its queue is paused.
+        let op = match flags {
+            WATCH_ADD | WATCH_ENABLE => libc::EPOLL_CTL_ADD,
+            WATCH_DELETE | WATCH_DISABLE => libc::EPOLL_CTL_DEL,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bad reader watch operation",
+                ));
+            }
+        };
+        let mut ev = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP) as u32,
+            u64: token,
+        };
+        // SAFETY: epoll_ctl reads ev for ADD and does not read it for DEL;
+        // both descriptors are owned by this Reader/Entry.
+        let r = unsafe {
+            libc::epoll_ctl(
+                self.wait.as_raw_fd(),
+                op,
+                fd,
+                if op == libc::EPOLL_CTL_DEL {
+                    std::ptr::null_mut()
+                } else {
+                    &mut ev
+                },
+            )
+        };
+        if r < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn ctl(&self, _fd: RawFd, _flags: u16, _token: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "reader wait primitive is unavailable on this platform",
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
     fn run(&self) {
         // SAFETY: kevent is plain data.
         let mut events = vec![unsafe { std::mem::zeroed::<libc::kevent>() }; 64];
@@ -325,7 +385,7 @@ impl Reader {
             // SAFETY: events is valid for its length; no timeout.
             let n = unsafe {
                 libc::kevent(
-                    self.kq.as_raw_fd(),
+                    self.wait.as_raw_fd(),
                     std::ptr::null(),
                     0,
                     events.as_mut_ptr(),
@@ -356,6 +416,43 @@ impl Reader {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn run(&self) {
+        // SAFETY: zeroed epoll_event is valid storage for epoll_wait to fill.
+        let mut events = vec![unsafe { std::mem::zeroed::<libc::epoll_event>() }; 64];
+        loop {
+            // SAFETY: events is valid for its length; -1 waits indefinitely.
+            let n = unsafe {
+                libc::epoll_wait(
+                    self.wait.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    events.len() as libc::c_int,
+                    -1,
+                )
+            };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                self.fail(&e.to_string());
+                return;
+            }
+            for ev in &events[..n as usize] {
+                let token = ev.u64;
+                let Some(e) = lock(&self.conns).get(&token).cloned() else {
+                    continue; // ended since
+                };
+                self.pump(&e);
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn run(&self) {
+        self.fail("reader wait primitive is unavailable on this platform");
+    }
+
     /// Reads what e has and hands on every whole message, in order.
     fn pump(&self, e: &Entry) {
         let mut st = lock(&e.state);
@@ -383,7 +480,7 @@ impl Reader {
                 // between seeing the queue empty and this.
                 if !st.ended && e.conn.queued() {
                     st.paused = true;
-                    let _ = self.ctl(e.fd.as_raw_fd(), libc::EV_DISABLE, e.token);
+                    let _ = self.ctl(e.fd.as_raw_fd(), WATCH_DISABLE, e.token);
                 }
             }
             Err(err)
@@ -403,7 +500,7 @@ impl Reader {
             return;
         }
         st.ended = true;
-        let _ = self.ctl(e.fd.as_raw_fd(), libc::EV_DELETE, e.token);
+        let _ = self.ctl(e.fd.as_raw_fd(), WATCH_DELETE, e.token);
         lock(&self.conns).remove(&e.token);
         e.conn.deliver(Item::Finish(err));
     }
@@ -414,6 +511,18 @@ impl Reader {
         let all: Vec<_> = lock(&self.conns).values().cloned().collect();
         for e in all {
             self.end_locked(&e, &mut lock(&e.state), err.to_string());
+        }
+    }
+
+    /// Re-arms a paused connection after its queue drains. A failed rearm
+    /// must end the connection: epoll has already removed it, so leaving it
+    /// live would make it wait forever with no registration.
+    fn resume_locked(&self, e: &Entry, st: &mut State) {
+        if st.paused && !st.ended {
+            match self.ctl(e.fd.as_raw_fd(), WATCH_ENABLE, e.token) {
+                Ok(()) => st.paused = false,
+                Err(err) => self.end_locked(e, st, format!("reader resume: {err}")),
+            }
         }
     }
 }
@@ -428,10 +537,7 @@ pub(crate) fn resume(token: u64) {
         return;
     };
     let mut st = lock(&e.state);
-    if st.paused && !st.ended {
-        st.paused = false;
-        let _ = r.ctl(e.fd.as_raw_fd(), libc::EV_ENABLE, e.token);
-    }
+    r.resume_locked(&e, &mut st);
 }
 
 /// Ends the connection added as token, from its own side (its closer):
@@ -457,6 +563,36 @@ fn is_socket(fd: RawFd) -> bool {
     // SAFETY: fstat on a descriptor we hold, into st.
     let r = unsafe { libc::fstat(fd, &mut st) };
     r == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
+}
+
+#[cfg(target_os = "macos")]
+fn make_wait() -> Option<OwnedFd> {
+    // SAFETY: kqueue takes nothing; a non-negative result is ours.
+    let fd = unsafe { libc::kqueue() };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fd is a descriptor we just made, ours to own.
+    let fd = unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        OwnedFd::from_raw_fd(fd)
+    };
+    Some(fd)
+}
+
+#[cfg(target_os = "linux")]
+fn make_wait() -> Option<OwnedFd> {
+    // SAFETY: epoll_create1 takes no pointers; a non-negative result is ours.
+    let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    (fd >= 0).then(|| {
+        // SAFETY: fd is a descriptor we just made, ours to own.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn make_wait() -> Option<OwnedFd> {
+    None
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -602,5 +738,53 @@ mod tests {
             assert_eq!(got, want, "{name}");
             assert_eq!(e, end, "{name}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reader_has_an_epoll_waiter() {
+        let reader = Reader::make().expect("Linux epoll should be available");
+        assert!(reader.wait.as_raw_fd() >= 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_resume_failure_finishes_the_connection() {
+        use std::fs::File;
+        use std::net::{Shutdown, UnixStream};
+
+        let reader = Reader::make().expect("Linux epoll should be available");
+        let replacement = File::open("/dev/null").unwrap();
+        // Replace the epoll descriptor with a regular file. epoll_ctl then
+        // fails deterministically, without relying on resource exhaustion.
+        assert!(unsafe { libc::dup2(replacement.as_raw_fd(), reader.wait.as_raw_fd()) } >= 0);
+
+        let (r, w) = UnixStream::pair().unwrap();
+        let closer = w.try_clone().unwrap();
+        let conn = Conn::framed(
+            r,
+            w,
+            move || {
+                let _ = closer.shutdown(Shutdown::Both);
+            },
+            None,
+        );
+        let (fd, _peer) = UnixStream::pair().unwrap();
+        let entry = Entry {
+            token: 1,
+            fd: OwnedFd::from(fd),
+            sock: true,
+            conn: conn.clone(),
+            state: Mutex::new(State {
+                framer: Framer::new(Framing::Frames),
+                ended: false,
+                paused: true,
+            }),
+        };
+        let mut state = lock(&entry.state);
+        reader.resume_locked(&entry, &mut state);
+        assert!(state.ended);
+        drop(state);
+        assert!(conn.err().starts_with("reader resume:"));
     }
 }

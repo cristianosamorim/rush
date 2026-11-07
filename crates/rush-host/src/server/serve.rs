@@ -10,7 +10,7 @@
 //! Where the kqueue can't be made, a thread waits on each as before
 //! (serve_on).
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use super::*;
 
@@ -48,6 +48,7 @@ impl Wake {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn kevent_of(ident: usize, filter: i16, flags: u16, fflags: u32) -> libc::kevent {
     // SAFETY: kevent is plain data.
     let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
@@ -59,6 +60,7 @@ fn kevent_of(ident: usize, filter: i16, flags: u16, fflags: u32) -> libc::kevent
 }
 
 /// Registers one change on kq: whether it took, and the error when not.
+#[cfg(target_os = "macos")]
 fn change(kq: &OwnedFd, ev: libc::kevent) -> std::io::Result<()> {
     // SAFETY: one valid change, no events read.
     let r = unsafe {
@@ -80,11 +82,14 @@ fn change(kq: &OwnedFd, ev: libc::kevent) -> std::io::Result<()> {
 
 /// What a change to the folder itself (not an entry in it) says: it's
 /// gone or moved, so it's watched again by its path.
+#[cfg(target_os = "macos")]
 const FOLDER_GONE: u32 = libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
 
 /// Watches dir's entries on kq: its descriptor, which stops the watch as
 /// it closes; None when it can't be opened.
+#[cfg(target_os = "macos")]
 fn watch_folder(kq: &OwnedFd, dir: &Path) -> Option<OwnedFd> {
+    use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
     // SAFETY: c is a NUL-terminated path.
@@ -173,7 +178,9 @@ impl Host {
     /// in one kqueue on this thread, until the host quits: true then.
     /// False at once when the wait can't be made: the caller's threads
     /// do it. What can't be watched so is watched by a thread as before.
+    #[cfg(target_os = "macos")]
     pub(super) fn serve_kq(&self, ln: &UnixListener, sock: &Path, owner: Option<i64>) -> bool {
+        use std::os::fd::{FromRawFd, RawFd};
         let Some(wake) = &self.wake else {
             return false;
         };
@@ -305,6 +312,224 @@ impl Host {
                         }
                     }
                     libc::EVFILT_PROC => owner_gone = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn epoll_add(epoll: std::os::fd::RawFd, fd: std::os::fd::RawFd, tag: u64) -> std::io::Result<()> {
+    let mut event = libc::epoll_event {
+        events: (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP) as u32,
+        u64: tag,
+    };
+    // SAFETY: epoll and fd are descriptors owned by the caller, and event is
+    // a valid epoll_event for the duration of the call.
+    let r = unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, fd, &mut event) };
+    (r == 0)
+        .then_some(())
+        .ok_or_else(std::io::Error::last_os_error)
+}
+
+#[cfg(target_os = "linux")]
+fn watch_folder_linux(dir: &Path) -> Option<OwnedFd> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: path is NUL-terminated and flags are the inotify_init1 flags.
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let flags = libc::IN_ATTRIB
+        | libc::IN_CREATE
+        | libc::IN_DELETE
+        | libc::IN_DELETE_SELF
+        | libc::IN_MODIFY
+        | libc::IN_MOVED_FROM
+        | libc::IN_MOVED_TO
+        | libc::IN_MOVE_SELF
+        | libc::IN_CLOSE_WRITE;
+    // SAFETY: fd is a valid inotify descriptor and path is NUL-terminated.
+    if unsafe { libc::inotify_add_watch(fd, path.as_ptr(), flags) } < 0 {
+        // SAFETY: fd was created above and has not been wrapped yet.
+        unsafe { libc::close(fd) };
+        return None;
+    }
+    // SAFETY: a non-negative descriptor created by inotify_init1 is ours.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn drain_inotify(fd: std::os::fd::RawFd) -> bool {
+    let mut changed = false;
+    let mut buf = [0u8; 8192];
+    loop {
+        // SAFETY: buf is writable for its complete length and fd is a
+        // non-blocking inotify descriptor owned by the caller.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            changed = true;
+            continue;
+        }
+        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break;
+    }
+    changed
+}
+
+impl Host {
+    /// Linux equivalent of the macOS kqueue wait: epoll serves clients and
+    /// the quit pipe, inotify wakes when the socket's folder changes, and a
+    /// pidfd reports the owner's death without a polling loop.
+    #[cfg(target_os = "linux")]
+    pub(super) fn serve_kq(&self, ln: &UnixListener, sock: &Path, owner: Option<i64>) -> bool {
+        use std::os::fd::{FromRawFd, RawFd};
+
+        let Some(wake) = &self.wake else {
+            return false;
+        };
+        // SAFETY: epoll_create1 takes flags and returns a new descriptor.
+        let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epoll < 0 {
+            return false;
+        }
+        // SAFETY: epoll_create1 returned a descriptor owned by this method.
+        let epoll = unsafe { OwnedFd::from_raw_fd(epoll) };
+        const LISTEN: u64 = 1;
+        const WAKE: u64 = 2;
+        const FOLDER: u64 = 3;
+        const OWNER: u64 = 4;
+        let listen = ln.as_raw_fd();
+        if epoll_add(epoll.as_raw_fd(), listen, LISTEN).is_err()
+            || epoll_add(epoll.as_raw_fd(), wake.r.as_raw_fd(), WAKE).is_err()
+        {
+            return false;
+        }
+
+        let dir = sock.parent().map(Path::to_path_buf).unwrap_or_default();
+        let folder = watch_folder_linux(&dir);
+        if let Some(folder) = &folder {
+            if epoll_add(epoll.as_raw_fd(), folder.as_raw_fd(), FOLDER).is_err() {
+                return false;
+            }
+        } else {
+            // inotify is unavailable on an unusual proc/container setup;
+            // keep the socket semantics by using the existing watcher.
+            let h = self.clone();
+            let s = sock.to_path_buf();
+            self.go("sock", move |_| h.watch_sock(&s));
+        }
+
+        let mut _owner_fd = None;
+        let mut owner_gone = false;
+        if let Some(pid) = owner {
+            // SAFETY: pidfd_open takes a pid and flags, both plain integers.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as RawFd;
+            if fd >= 0 {
+                // SAFETY: this descriptor was returned by pidfd_open above.
+                let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                if epoll_add(epoll.as_raw_fd(), fd.as_raw_fd(), OWNER).is_err() {
+                    return false;
+                }
+                _owner_fd = Some(fd);
+            } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                owner_gone = true;
+            } else {
+                let h = self.clone();
+                self.go("owner", move |_| h.watch_owner(pid));
+            }
+        }
+
+        let mut accepting = true;
+        let mut sock_watched = true;
+        // SAFETY: epoll_event is plain data.
+        let mut events: [libc::epoll_event; 8] = unsafe { std::mem::zeroed() };
+        loop {
+            if self.lock().quit {
+                return true;
+            }
+            if sock_watched && std::fs::symlink_metadata(sock).is_err() {
+                sock_watched = false;
+                self.stop_for(serde_json::json!({"why": "its socket is gone"}));
+            }
+            if owner_gone {
+                owner_gone = false;
+                let owner = owner.unwrap_or_default();
+                self.stop_for(serde_json::json!({
+                    "why": "the process that started it is gone",
+                    "owner": owner
+                }));
+            }
+            // SAFETY: events has room for eight events and epoll is owned by
+            // this method.  A negative result is handled below.
+            let n = unsafe {
+                libc::epoll_wait(
+                    epoll.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    events.len() as libc::c_int,
+                    -1,
+                )
+            };
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return false;
+            }
+            for event in &events[..n as usize] {
+                match event.u64 {
+                    LISTEN if accepting => match accept_now(ln) {
+                        Ok((c, _)) => {
+                            if self.lock().quit {
+                                return true;
+                            }
+                            let h = self.clone();
+                            self.go("client", move |_| h.serve(c));
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::ConnectionAborted
+                            ) => {}
+                        Err(_) => {
+                            accepting = false;
+                            // SAFETY: epoll and listen are valid descriptors;
+                            // deleting a missing registration is harmless.
+                            unsafe {
+                                libc::epoll_ctl(
+                                    epoll.as_raw_fd(),
+                                    libc::EPOLL_CTL_DEL,
+                                    listen,
+                                    std::ptr::null_mut(),
+                                );
+                            }
+                        }
+                    },
+                    WAKE => wake.drain(),
+                    FOLDER => {
+                        if let Some(folder) = &folder
+                            && drain_inotify(folder.as_raw_fd())
+                            && sock_watched
+                            && std::fs::symlink_metadata(sock).is_err()
+                        {
+                            sock_watched = false;
+                            self.stop_for(serde_json::json!({"why": "its socket is gone"}));
+                        }
+                    }
+                    OWNER => {
+                        owner_gone = true;
+                        // A dead pidfd stays readable. Close it after
+                        // the first notification, as EV_ONESHOT does on
+                        // macOS, so draining a session cannot spin.
+                        drop(_owner_fd.take());
+                    }
                     _ => {}
                 }
             }

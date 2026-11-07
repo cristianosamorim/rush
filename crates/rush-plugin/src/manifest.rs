@@ -548,7 +548,21 @@ impl Manifest {
 }
 
 /// The OS rush runs on, as Go's runtime.GOOS names it.
+#[cfg(target_os = "macos")]
 pub const GOOS: &str = "darwin";
+#[cfg(target_os = "linux")]
+pub const GOOS: &str = "linux";
+#[cfg(target_os = "windows")]
+pub const GOOS: &str = "windows";
+#[cfg(target_os = "freebsd")]
+pub const GOOS: &str = "freebsd";
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "freebsd"
+)))]
+pub const GOOS: &str = std::env::consts::OS;
 
 /// The architecture rush runs on, as Go's runtime.GOARCH names it.
 pub const GOARCH: &str = match std::env::consts::ARCH.as_bytes() {
@@ -776,6 +790,18 @@ pub fn category_named(id: &str) -> &'static Category {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_names_match_the_build_target() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(GOOS, "linux");
+        #[cfg(target_os = "macos")]
+        assert_eq!(GOOS, "darwin");
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(GOARCH, "amd64");
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(GOARCH, "arm64");
+    }
 
     fn raw(s: &str) -> RawJson {
         RawJson(serde_json::value::RawValue::from_string(s.into()).unwrap())

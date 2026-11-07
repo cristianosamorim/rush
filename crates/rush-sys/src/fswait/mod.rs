@@ -13,13 +13,38 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
 mod darwin;
+#[cfg(target_os = "macos")]
 mod deep;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(not(target_os = "macos"))]
+mod deep {
+    use std::path::PathBuf;
+
+    /// A notification callback for recursive watchers.
+    pub type Tell = Box<dyn Fn(Vec<PathBuf>) + Send + Sync>;
+
+    /// Recursive FSEvents is macOS-only; Linux callers keep their existing
+    /// timer/listing fallback while ordinary files use inotify `Watcher`.
+    pub struct Deep;
+
+    impl Deep {
+        pub fn new(_roots: &[PathBuf], _skip: &[PathBuf], _tell: Tell) -> Option<Deep> {
+            None
+        }
+    }
+}
 pub use deep::{Deep, Tell};
 
 /// Elsewhere there's no stream: callers keep their timer.
+#[cfg(target_os = "macos")]
 mod tree;
+#[cfg(target_os = "macos")]
 pub use darwin::{Watcher, grown};
+#[cfg(target_os = "linux")]
+pub use linux::{Watcher, grown};
 
 /// A file and the size it had when last read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,6 +108,7 @@ fn changed(files: &[File]) -> bool {
 }
 
 /// The fallback: a stat of each file every interval.
+#[cfg(target_os = "macos")]
 fn poll(stop: &Stop, files: &[File], every: Duration) -> bool {
     loop {
         if changed(files) {

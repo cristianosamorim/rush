@@ -105,6 +105,42 @@ Later modules, in order: host (running Claude headless, PTYs), the other
 adapters (codex, kimi, copilot, …), overview/efficiency/machine screens,
 plugins, pr drive/watch, remote, menubar, update.
 
+## Linux portability in this fork
+
+The `codex/linux-port` branch keeps the Rust terminal application and its
+provider/session contracts while selecting native implementations at
+compile time. The initial CI target is Ubuntu 24.04 x86_64 GNU/Linux,
+also usable inside WSL2; this is not native Windows support.
+
+Linux process discovery and resource readings use `/proc` and `/sys`.
+The process, file-watching, host-serving and plugin-reader boundaries
+provide Linux implementations rather than linking Darwin symbols. An
+unavailable Linux kernel notification primitive must fall back to a
+bounded wait rather than spinning or silently dropping a session.
+
+The Objective-C dependencies of the menu bar and speech helper are
+macOS target dependencies. Their data/wire APIs remain available to
+portable callers; attempting to launch an Apple helper on Linux returns
+an explicit unsupported error. Keychain remains macOS-only; Linux uses
+the private file vault, and its cache follows the XDG cache directory.
+Desktop opening uses `xdg-open`, while clipboard images can be read with
+Wayland's `wl-paste` or X11's `xclip`. The remote HTTP server remains
+portable; installing its LaunchAgent does not.
+
+Installed plugins must keep the sandbox contract: Linux support must
+never turn a missing macOS sandbox into unsandboxed execution. The
+existing refusal remains; bundled plugins use their existing broker.
+
+Tests still run on GitHub CI. The test-home constructor uses Mach-O's
+`__mod_init_func` on macOS and ELF's `.init_array` on Linux, before any
+test thread starts. The Linux workflow runs formatting, Clippy across
+all targets, workspace tests, a release build and command-line smoke
+checks, then retains the resulting executable. macOS-only benchmarks
+and native helper tests are gated at the platform boundary. No Linux
+performance or real-provider compatibility claim is implied by the port.
+
+See [docs/linux.md](docs/linux.md) for installation and platform limits.
+
 ## Contracts
 
 What flows between the crates, and who owns each type. Wave B (host, live

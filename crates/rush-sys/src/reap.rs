@@ -12,11 +12,13 @@ use std::sync::{Mutex, OnceLock};
 
 type Then = Box<dyn FnOnce(io::Result<ExitStatus>) + Send>;
 
+#[cfg(target_os = "macos")]
 struct Reaper {
     kq: OwnedFd,
     waiting: Mutex<HashMap<u32, (Child, Then)>>,
 }
 
+#[cfg(target_os = "macos")]
 fn reaper() -> Option<&'static Reaper> {
     static R: OnceLock<Option<&'static Reaper>> = OnceLock::new();
     *R.get_or_init(|| {
@@ -38,6 +40,7 @@ fn reaper() -> Option<&'static Reaper> {
     })
 }
 
+#[cfg(target_os = "macos")]
 impl Reaper {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u32, (Child, Then)>> {
         self.waiting.lock().unwrap_or_else(|e| e.into_inner())
@@ -78,6 +81,7 @@ impl Reaper {
 }
 
 /// Reaps child (it has exited, or is about to be seen to) and runs then.
+#[cfg(target_os = "macos")]
 fn finish(mut child: Child, then: Then) {
     let st = child.wait();
     // One that panics ends only itself, not the reaper.
@@ -87,6 +91,7 @@ fn finish(mut child: Child, then: Then) {
 /// Runs then with how child ended, once it has, on the reaper's thread:
 /// then must be quick (set a flag, cancel, send). Where kqueue can't watch
 /// the child, a thread of its own waits for it, as before.
+#[cfg(target_os = "macos")]
 pub fn on_exit(child: Child, then: impl FnOnce(io::Result<ExitStatus>) + Send + 'static) {
     let then: Then = Box::new(then);
     let Some(r) = reaper() else {
@@ -128,12 +133,161 @@ pub fn on_exit(child: Child, then: impl FnOnce(io::Result<ExitStatus>) + Send + 
     }
 }
 
+#[cfg(target_os = "macos")]
 fn wait_on_thread(child: Child, then: Then) {
     let spawned = crate::threads::spawn_small("rush-reap-one", move || finish(child, then));
     debug_assert!(spawned.is_ok(), "a thread to wait for a child");
 }
 
 /// How many children the reaper waits for now.
+#[cfg(target_os = "macos")]
+pub fn waiting() -> usize {
+    reaper().map_or(0, |r| r.lock().len())
+}
+
+/// Linux's pidfds are pollable for children and let one reaper thread handle
+/// every plugin without one blocking thread per process. A wake pipe makes a
+/// newly registered pidfd visible to the sleeping poll immediately.
+#[cfg(target_os = "linux")]
+struct LinuxReaper {
+    wake_r: OwnedFd,
+    wake_w: OwnedFd,
+    waiting: Mutex<HashMap<u32, (OwnedFd, Child, Then)>>,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pidfd(pid: u32) -> Option<OwnedFd> {
+    // SAFETY: pid and flags are plain syscall arguments.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as libc::c_int;
+    (fd >= 0).then(|| {
+        // SAFETY: fd is returned by pidfd_open and is owned here.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: fds points to two writable integers; pipe2 initializes both.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful pipe2 returned two owned descriptors.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+#[cfg(target_os = "linux")]
+fn reaper() -> Option<&'static LinuxReaper> {
+    static R: OnceLock<Option<&'static LinuxReaper>> = OnceLock::new();
+    *R.get_or_init(|| {
+        let (wake_r, wake_w) = linux_pipe().ok()?;
+        let r: &'static LinuxReaper = Box::leak(Box::new(LinuxReaper {
+            wake_r,
+            wake_w,
+            waiting: Mutex::new(HashMap::new()),
+        }));
+        crate::threads::spawn_small("rush-reap", move || r.run()).ok()?;
+        Some(r)
+    })
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxReaper {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u32, (OwnedFd, Child, Then)>> {
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wake(&self) {
+        let byte = [1u8];
+        // SAFETY: byte is a valid one-byte buffer and wake_w is a pipe writer.
+        unsafe { libc::write(self.wake_w.as_raw_fd(), byte.as_ptr().cast(), 1) };
+    }
+
+    fn run(&self) {
+        let mut buf = [0u8; 256];
+        loop {
+            let mut fds = Vec::new();
+            let mut pids = Vec::new();
+            fds.push(libc::pollfd {
+                fd: self.wake_r.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            {
+                let waiting = self.lock();
+                for (pid, (fd, _, _)) in waiting.iter() {
+                    pids.push(*pid);
+                    fds.push(libc::pollfd {
+                        fd: fd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    });
+                }
+            }
+            // SAFETY: all descriptors are live, and poll writes revents.
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+            if n < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            }
+            if fds[0].revents != 0 {
+                loop {
+                    // SAFETY: buf is valid for writes and wake_r is nonblocking.
+                    let n = unsafe {
+                        libc::read(self.wake_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+                    };
+                    if n <= 0 {
+                        break;
+                    }
+                }
+            }
+            for (i, pid) in pids.into_iter().enumerate() {
+                if fds[i + 1].revents
+                    & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                    == 0
+                {
+                    continue;
+                }
+                let got = self.lock().remove(&pid);
+                if let Some((_, child, then)) = got {
+                    finish(child, then);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn finish(mut child: Child, then: Then) {
+    let st = child.wait();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || then(st)));
+}
+
+#[cfg(target_os = "linux")]
+pub fn on_exit(child: Child, then: impl FnOnce(io::Result<ExitStatus>) + Send + 'static) {
+    let then: Then = Box::new(then);
+    let Some(r) = reaper() else {
+        wait_on_thread(child, then);
+        return;
+    };
+    let pid = child.id();
+    let Some(fd) = linux_pidfd(pid) else {
+        wait_on_thread(child, then);
+        return;
+    };
+    r.lock().insert(pid, (fd, child, then));
+    r.wake();
+}
+
+#[cfg(target_os = "linux")]
+fn wait_on_thread(child: Child, then: Then) {
+    let spawned = crate::threads::spawn_small("rush-reap-one", move || finish(child, then));
+    debug_assert!(spawned.is_ok(), "a thread to wait for a child");
+}
+
+#[cfg(target_os = "linux")]
 pub fn waiting() -> usize {
     reaper().map_or(0, |r| r.lock().len())
 }

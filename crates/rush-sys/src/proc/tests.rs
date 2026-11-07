@@ -71,6 +71,7 @@ fn readable_env_only_when_the_kernel_gives_it() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn procargs2() {
     let mut b = 2u32.to_le_bytes().to_vec();
     b.extend_from_slice(b"/bin/x\0\0\0\0x\0-y\0A=1\0B=2\0\0junk\0");

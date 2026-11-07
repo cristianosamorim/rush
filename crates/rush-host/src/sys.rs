@@ -1,5 +1,5 @@
 //! Waiting on processes without polling them: kqueue's NOTE_EXIT on macOS,
-//! a look every 50ms elsewhere (as Go looks everywhere).
+//! pidfds on Linux, and a look every 50ms elsewhere (as Go looks everywhere).
 
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,7 @@ pub fn wait_exit(pid: i64, timeout: Duration) -> bool {
     if !crate::alive(pid) {
         return true;
     }
-    if let Some(gone) = kq_wait(pid as i32, Some(timeout)) {
+    if let Some(gone) = wait_kernel(pid as i32, Some(timeout)) {
         return gone || !crate::alive(pid);
     }
     let end = Instant::now() + timeout;
@@ -23,7 +23,7 @@ pub fn wait_exit(pid: i64, timeout: Duration) -> bool {
 
 /// Waits until pid exits, for as long as it takes.
 pub fn wait_exit_forever(pid: i64) {
-    if kq_wait(pid as i32, None).is_some() {
+    if wait_kernel(pid as i32, None).is_some() {
         return;
     }
     while crate::alive(pid) {
@@ -31,9 +31,10 @@ pub fn wait_exit_forever(pid: i64) {
     }
 }
 
-/// Waits on kqueue for pid's exit: Some(true) when it did, Some(false) at
-/// the timeout, None when it can't wait so (no kqueue, or no such pid).
-fn kq_wait(pid: i32, timeout: Option<Duration>) -> Option<bool> {
+/// Waits on a kernel process-death notification: Some(true) when it did,
+/// Some(false) at the timeout, None when this platform cannot watch pid.
+#[cfg(target_os = "macos")]
+fn wait_kernel(pid: i32, timeout: Option<Duration>) -> Option<bool> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // SAFETY: kqueue takes nothing; a non-negative result is ours.
     let kq = unsafe { libc::kqueue() };
@@ -83,6 +84,54 @@ fn kq_wait(pid: i32, timeout: Option<Duration>) -> Option<bool> {
         }
         return Some(n > 0);
     }
+}
+
+/// Linux's pidfd is pollable even for a process which is not our child.  The
+/// descriptor closes only when that particular process exits, so PID reuse
+/// cannot make a host wait for the wrong process.
+#[cfg(target_os = "linux")]
+fn wait_kernel(pid: i32, timeout: Option<Duration>) -> Option<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // SAFETY: pidfd_open takes a pid and flags, both plain integers.  The
+    // returned descriptor is owned by this function.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as libc::c_int;
+    if fd < 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Some(true),
+            _ => None, // an older kernel, or a process we cannot inspect
+        };
+    }
+    // SAFETY: pidfd_open returned a non-negative descriptor owned by us.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        revents: 0,
+    };
+    let timeout = timeout.map_or(-1, |d| {
+        let ms = d.as_millis().min(i32::MAX as u128) as i32;
+        if ms == 0 && !d.is_zero() { 1 } else { ms }
+    });
+    loop {
+        // SAFETY: pfd points to one initialized pollfd owned by this stack
+        // frame; timeout is in milliseconds as poll(2) expects.
+        let n = unsafe { libc::poll(&mut pfd, 1, timeout) };
+        if n > 0 {
+            return Some(true);
+        }
+        if n == 0 {
+            return Some(false);
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return None;
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn wait_kernel(_pid: i32, _timeout: Option<Duration>) -> Option<bool> {
+    None
 }
 
 /// How much a host's socket holds each way: macOS gives a unix socket

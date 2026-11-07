@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 use std::ffi::CStr;
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Each interface's bytes in and out, by index.
@@ -124,6 +126,7 @@ pub(crate) fn network_of(addrs: &[(String, IpAddr)]) -> (String, String) {
 /// read from the routing table's interface list: no process run. macOS
 /// hands them to a process that isn't root cut to 32 bits, so they wrap
 /// every 4G; rates allow for that.
+#[cfg(target_os = "macos")]
 pub(crate) fn counters() -> Option<Counters> {
     let mut mib = [libc::CTL_NET, libc::PF_ROUTE, 0, 0, libc::NET_RT_IFLIST2, 0];
     let mut len: libc::size_t = 0;
@@ -177,28 +180,149 @@ pub(crate) fn counters() -> Option<Counters> {
     }
 }
 
+/// Linux exposes the same per-interface counters in `/proc/net/dev`.
+/// A missing or unreadable procfs is reported as `None`; normal Linux systems
+/// have the file and therefore return `Some`, including when no eligible
+/// interface remains after tunnel filtering.
+#[cfg(target_os = "linux")]
+pub(crate) fn counters() -> Option<Counters> {
+    let text = std::fs::read_to_string("/proc/net/dev").ok()?;
+    Some(parse_proc_net_dev(&text, linux_ifindex))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn counters() -> Option<Counters> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_ifindex(name: &str) -> u32 {
+    let Ok(name) = CString::new(name) else {
+        return 0;
+    };
+    // SAFETY: name is NUL-terminated and lives for the call.
+    unsafe { libc::if_nametoindex(name.as_ptr()) }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_net_dev(text: &str, ifindex: impl Fn(&str) -> u32) -> Counters {
+    let mut out = Counters::new();
+    for line in text.lines() {
+        let Some((name, values)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() || tunnel(name) {
+            continue;
+        }
+        let fields: Vec<_> = values.split_whitespace().collect();
+        // receive bytes plus seven receive fields, then transmit bytes.
+        if fields.len() < 9 {
+            continue;
+        }
+        let (Ok(rx), Ok(tx)) = (fields[0].parse::<u64>(), fields[8].parse::<u64>()) else {
+            continue;
+        };
+        let index = ifindex(name);
+        if index != 0 {
+            out.insert(index, [rx, tx]);
+        }
+    }
+    out
+}
+
 /// Calls changed(true) each time the machine's addresses or links change,
 /// from a thread that sleeps in the kernel between, and changed(false) if
 /// it stops being able to hear of them; false where there's no way to hear
 /// of it at all (the caller then looks on its sample instead). The thread
 /// ends when changed returns false.
 pub(crate) fn on_change(changed: impl FnMut(bool) -> bool + Send + 'static) -> bool {
-    // SAFETY: a plain socket, kept from the processes rush starts (macOS
-    // has no SOCK_CLOEXEC); closed when the thread ends.
-    let fd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
-    if fd < 0 {
-        return false;
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: a plain socket, kept from the processes rush starts (macOS
+        // has no SOCK_CLOEXEC); closed when the thread ends.
+        let fd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
+        if fd < 0 {
+            return false;
+        }
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        listen(fd, changed, |m| {
+            // Only addresses and links: routes and ARP entries come and go all
+            // the time on a busy network.
+            m.len() >= 4
+                && matches!(
+                    m[3] as libc::c_int,
+                    libc::RTM_NEWADDR | libc::RTM_DELADDR | libc::RTM_IFINFO
+                )
+        })
     }
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-    listen(fd, changed, |m| {
-        // Only addresses and links: routes and ARP entries come and go all
-        // the time on a busy network.
-        m.len() >= 4
-            && matches!(
-                m[3] as libc::c_int,
-                libc::RTM_NEWADDR | libc::RTM_DELADDR | libc::RTM_IFINFO
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux's route netlink groups report link and address changes. If
+        // the socket or bind is unavailable, returning false asks netwatch
+        // to use its existing periodic sample fallback.
+        const RTMGRP_LINK: libc::c_uint = 1;
+        const RTMGRP_IPV4_IFADDR: libc::c_uint = 0x10;
+        const RTMGRP_IPV6_IFADDR: libc::c_uint = 0x100;
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
             )
-    })
+        };
+        if fd < 0 {
+            return false;
+        }
+        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as _;
+        addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+        // SAFETY: addr is a valid netlink sockaddr and fd is ours.
+        let bound = unsafe {
+            libc::bind(
+                fd,
+                (&addr as *const libc::sockaddr_nl).cast(),
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        } == 0;
+        if !bound {
+            unsafe { libc::close(fd) };
+            return false;
+        }
+        listen(fd, changed, netlink_matters)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = changed;
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn netlink_matters(mut b: &[u8]) -> bool {
+    const NLMSG_HDRLEN: usize = 16;
+    const RTM_NEWLINK: u16 = 16;
+    const RTM_DELLINK: u16 = 17;
+    const RTM_NEWADDR: u16 = 20;
+    const RTM_DELADDR: u16 = 21;
+    while b.len() >= NLMSG_HDRLEN {
+        let len = u32::from_ne_bytes(b[..4].try_into().unwrap()) as usize;
+        if len < NLMSG_HDRLEN || len > b.len() {
+            break;
+        }
+        let kind = u16::from_ne_bytes(b[4..6].try_into().unwrap());
+        if matches!(kind, RTM_NEWLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR) {
+            return true;
+        }
+        let aligned = (len + 3) & !3;
+        if aligned > b.len() {
+            break;
+        }
+        b = &b[aligned..];
+    }
+    false
 }
 
 /// Reads fd's messages on a thread of its own, calling changed for each
@@ -296,5 +420,13 @@ mod tests {
         for (addrs, key, label) in cases {
             assert_eq!(network_of(&addrs), (key.to_string(), label.to_string()));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proc_counters_parse_receive_and_transmit_bytes() {
+        let text = "eth0: 12 1 0 0 0 0 0 0 34 2 0 0 0 0 0 0\nlo: 99 1 0 0 0 0 0 0 88 2 0 0 0 0 0 0\nveth0: 77 1 0 0 0 0 0 0 66 2 0 0 0 0 0 0\nbad0: x 1 0\n";
+        let got = parse_proc_net_dev(text, |name| (name == "eth0").then_some(7).unwrap_or(0));
+        assert_eq!(got, HashMap::from([(7, [12, 34])]))
     }
 }

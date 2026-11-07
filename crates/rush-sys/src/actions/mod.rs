@@ -95,6 +95,7 @@ fn poll_exits(tab: &Table, pids: &[Pid], end: Instant) -> Vec<Pid> {
 
 /// Waiting for processes to exit on kqueue: it returns the moment the last
 /// one goes, rather than at the next look.
+#[cfg(target_os = "macos")]
 mod exits {
     use std::collections::HashSet;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -186,6 +187,90 @@ mod exits {
     }
 }
 
+/// Linux waits on pidfds, which are pollable for any process visible to the
+/// caller. Registration happens before the final start-time/zombie check, so
+/// an exit cannot be missed between reading the process table and sleeping.
+#[cfg(target_os = "linux")]
+mod exits {
+    use std::collections::HashMap;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::time::Instant;
+
+    use crate::proc::{self, Pid, Table};
+
+    fn pidfd(pid: Pid) -> Option<OwnedFd> {
+        // SAFETY: pid and flags are plain syscall arguments.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as libc::c_int;
+        (fd >= 0).then(|| {
+            // SAFETY: fd is returned by pidfd_open and is owned here.
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        })
+    }
+
+    pub(super) fn wait(tab: &Table, pids: &[Pid], end: Instant) -> Option<Vec<Pid>> {
+        let mut fds = Vec::new();
+        for &pid in pids {
+            let Some(fd) = pidfd(pid) else {
+                // A kernel without pidfd_open (or a process we cannot see)
+                // asks the caller to use its conservative table fallback.
+                return None;
+            };
+            let same = proc::started(pid)
+                .is_some_and(|s| tab.procs.get(&pid).is_some_and(|p| p.start == s));
+            if same && !proc::zombie(pid) {
+                fds.push((pid, fd));
+            }
+        }
+        let mut pollfds: Vec<libc::pollfd> = fds
+            .iter()
+            .map(|(_, fd)| libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        while !pollfds.is_empty() {
+            let Some(left) = end
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+            else {
+                break;
+            };
+            let ms = left.as_millis().min(i32::MAX as u128) as i32;
+            // SAFETY: pollfds points to live pidfds and poll writes revents.
+            let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, ms) };
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return None;
+            }
+            if n == 0 {
+                break;
+            }
+            let mut i = 0;
+            while i < pollfds.len() {
+                if pollfds[i].revents
+                    & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                    != 0
+                {
+                    pollfds.swap_remove(i);
+                    fds.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        let left: HashMap<Pid, ()> = fds.into_iter().map(|(pid, _)| (pid, ())).collect();
+        Some(
+            pids.iter()
+                .copied()
+                .filter(|pid| left.contains_key(pid))
+                .collect(),
+        )
+    }
+}
+
 /// Sends sig to a process and everything under it: SIGSTOP to pause the
 /// lot, SIGCONT to let it go on. Root goes first, so a paused tree can't
 /// start more while it's walked. It reports how many it signalled.
@@ -230,26 +315,50 @@ pub fn terminate(pid: Pid) -> Result<(), KillError> {
 
 /// Posts a macOS notification; it spawns only on state transitions.
 pub fn notify(title: &str, body: &str) {
-    let script = format!(
-        "display notification {} with title {}",
-        go_quote(body),
-        go_quote(title)
-    );
-    if let Ok(mut c) = std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+    #[cfg(target_os = "linux")]
     {
-        std::thread::spawn(move || {
-            let _ = c.wait();
-        });
+        if let Ok(mut c) = std::process::Command::new("notify-send")
+            .args([title, body])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            std::thread::spawn(move || {
+                let _ = c.wait();
+            });
+        }
+        return;
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+    {
+        let _ = (title, body);
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display notification {} with title {}",
+            go_quote(body),
+            go_quote(title)
+        );
+        if let Ok(mut c) = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            std::thread::spawn(move || {
+                let _ = c.wait();
+            });
+        }
     }
 }
 
 /// s as Go's %q writes it, which AppleScript reads as a string: double
 /// quotes, with backslash escapes.
+#[cfg(target_os = "macos")]
 fn go_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');

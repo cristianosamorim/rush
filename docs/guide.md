@@ -52,7 +52,7 @@
 brew install 0xdeafcafe/tap/rush
 ```
 
-Use the full name: homebrew/core has a different `rush` (GNU's restricted shell), and plain `brew install rush` gets that one. It runs on Macs with Apple silicon only.
+Use the full name: homebrew/core has a different `rush` (GNU's restricted shell), and plain `brew install rush` gets that one. These Homebrew packages run on Macs with Apple silicon. This fork also has an experimental [Linux and WSL2 port](linux.md); use that page's source installation instructions for Linux.
 
 Or build it from source, with Rust (stable) and cargo:
 

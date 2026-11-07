@@ -59,7 +59,10 @@ pub fn paste_clip_image(m: &mut Model, key: &str) -> Out {
 /// Finder as itself, image data saved as a PNG under the temp dir. None
 /// when the clipboard holds no image.
 pub fn clip_image() -> Result<Option<String>, String> {
-    let dir = std::env::temp_dir().join("rush-images");
+    let dir = images_dir();
+    #[cfg(target_os = "linux")]
+    private_image_dir(&dir)?;
+    #[cfg(not(target_os = "linux"))]
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let out = dir.join(format!(
         "clipboard-{}.png",
@@ -170,7 +173,53 @@ pub fn pbcopy(m: &mut Model, text: String) {
 
 /// The folder clipboard images are saved in.
 pub fn images_dir() -> PathBuf {
+    if cfg!(target_os = "linux") {
+        return rush_state::dir().join("clipboard-images");
+    }
     std::env::temp_dir().join("rush-images")
+}
+
+#[cfg(target_os = "linux")]
+fn private_image_dir(dir: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| e.to_string())?;
+    let metadata = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
+    // SAFETY: geteuid reads this process's effective user id.
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(
+            "the clipboard image directory must be a private directory owned by you".into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn image_directory_is_private_and_rejects_shared_or_substituted_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let private = temp.path().join("images");
+        private_image_dir(&private).unwrap();
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let link = temp.path().join("substituted");
+        symlink(&private, &link).unwrap();
+        assert!(private_image_dir(&link).is_err());
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_image_dir(&private).is_err());
+    }
 }
 
 /// Writes the clipboard's image to argv[0] as a PNG and prints "png",

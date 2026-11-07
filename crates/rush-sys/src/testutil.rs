@@ -36,33 +36,62 @@ pub fn wait_stopped(pid: i32, cont: bool) {
 /// Whether pid exits (or is gone already) within d: any process, not only
 /// our children. kqueue's EVFILT_PROC says so the moment it does.
 pub fn gone_within(pid: i32, d: Duration) -> bool {
-    // SAFETY: plain kqueue calls on a kqueue we own and close.
-    unsafe {
-        let kq = libc::kqueue();
-        assert!(kq >= 0);
-        let mut ev: libc::kevent = std::mem::zeroed();
-        ev.ident = pid as usize;
-        ev.filter = libc::EVFILT_PROC;
-        ev.flags = libc::EV_ADD | libc::EV_ONESHOT;
-        ev.fflags = libc::NOTE_EXIT;
-        if libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) < 0 {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: plain kqueue calls on a kqueue we own and close.
+        unsafe {
+            let kq = libc::kqueue();
+            assert!(kq >= 0);
+            let mut ev: libc::kevent = std::mem::zeroed();
+            ev.ident = pid as usize;
+            ev.filter = libc::EVFILT_PROC;
+            ev.flags = libc::EV_ADD | libc::EV_ONESHOT;
+            ev.fflags = libc::NOTE_EXIT;
+            if libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) < 0 {
+                libc::close(kq);
+                return true; // ESRCH: not there
+            }
+            // Exited, but still a zombie of a parent that hasn't reaped it.
+            if crate::proc::zombie(pid) {
+                libc::close(kq);
+                return true;
+            }
+            let ts = libc::timespec {
+                tv_sec: d.as_secs() as libc::time_t,
+                tv_nsec: d.subsec_nanos() as libc::c_long,
+            };
+            let mut out: libc::kevent = std::mem::zeroed();
+            let n = libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, &ts);
             libc::close(kq);
-            return true; // ESRCH: not there
+            n > 0
         }
-        // Exited, but still a zombie of a parent that hasn't reaped it.
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
         if crate::proc::zombie(pid) {
-            libc::close(kq);
             return true;
         }
-        let ts = libc::timespec {
-            tv_sec: d.as_secs() as libc::time_t,
-            tv_nsec: d.subsec_nanos() as libc::c_long,
+        // SAFETY: pid and flags are plain syscall arguments.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as libc::c_int;
+        if fd < 0 {
+            return true; // ESRCH or a process already gone.
+        }
+        // SAFETY: fd is returned by pidfd_open and is owned here.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
         };
-        let mut out: libc::kevent = std::mem::zeroed();
-        let n = libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, &ts);
-        libc::close(kq);
-        n > 0
+        let ms = d.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: pfd is a valid pollfd and poll writes only revents.
+        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+        return n > 0;
     }
+    #[allow(unreachable_code)]
+    false
 }
 
 /// Whether pid answers kill(pid, 0) and isn't a zombie.

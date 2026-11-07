@@ -1,7 +1,7 @@
 //! Waiting for a process that isn't ours to go: the node process a gate
 //! holder holds a run for. Go looks every 250ms (cmd/rush/gate.go:416);
-//! here kqueue says the moment it exits, and elsewhere it's still a look
-//! every 250ms.
+//! here kqueue/pidfd says the moment it exits, and elsewhere it's still a
+//! look every 250ms.
 
 use rush_sys::proc::{self, Pid};
 
@@ -12,7 +12,7 @@ fn runs(pid: Pid) -> bool {
 
 /// Returns once pid has gone.
 pub fn wait_gone(pid: Pid) {
-    if kq_wait(pid) {
+    if wait_kernel(pid) {
         return;
     }
     let c = crate::gate::Cancel::new();
@@ -21,8 +21,10 @@ pub fn wait_gone(pid: Pid) {
     }
 }
 
-/// Waits on kqueue for pid's exit; false when it can't, to look instead.
-fn kq_wait(pid: Pid) -> bool {
+/// Waits on macOS's process filter for pid's exit; false when it can't, to
+/// look instead.
+#[cfg(target_os = "macos")]
+fn wait_kernel(pid: Pid) -> bool {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // SAFETY: kqueue takes nothing; a non-negative result is ours.
     let kq = unsafe { libc::kqueue() };
@@ -76,6 +78,43 @@ fn kq_wait(pid: Pid) -> bool {
             return false;
         }
     }
+}
+
+/// Linux's pidfd gives a race-free death notification for a non-child.  It is
+/// pollable and remains tied to this process instance even if the numeric PID
+/// is reused after exit.
+#[cfg(target_os = "linux")]
+fn wait_kernel(pid: Pid) -> bool {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // SAFETY: pidfd_open takes plain integers and returns a new descriptor.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as libc::c_int;
+    if fd < 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) || !runs(pid);
+    }
+    // SAFETY: the non-negative descriptor is newly owned by this function.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: pfd points to one initialized pollfd on this stack.
+        let n = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if n > 0 {
+            return true;
+        }
+        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return !runs(pid);
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn wait_kernel(_pid: Pid) -> bool {
+    false
 }
 
 #[cfg(test)]

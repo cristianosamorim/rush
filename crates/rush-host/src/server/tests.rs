@@ -4,6 +4,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use std::io::BufReader;
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
+
 use rush_core::adapter::Kind;
 
 use super::*;
@@ -40,6 +45,38 @@ impl Conn for Kept {
         Ok(())
     }
     fn close(&self) -> adapter::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct BlockingClose {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    closes: AtomicUsize,
+}
+
+#[cfg(target_os = "linux")]
+impl Conn for BlockingClose {
+    fn send(&self, _: Input) -> adapter::Result<()> {
+        Ok(())
+    }
+    fn answer(&self, _: &str, _: &str) -> adapter::Result<()> {
+        Ok(())
+    }
+    fn interrupt(&self) -> adapter::Result<()> {
+        Ok(())
+    }
+    fn set_model(&self, _: &str) -> adapter::Result<()> {
+        Ok(())
+    }
+    fn set_mode(&self, _: &str) -> adapter::Result<()> {
+        Ok(())
+    }
+    fn close(&self) -> adapter::Result<()> {
+        self.closes.fetch_add(1, Ordering::SeqCst);
+        let _ = self.entered.send(());
+        let _ = self.release.lock().unwrap().recv();
         Ok(())
     }
 }
@@ -931,6 +968,99 @@ pub(super) fn next(c: &Client, mut want: impl FnMut(&Line) -> bool) -> Line {
 
 pub(super) fn in_state(s: &'static str) -> impl FnMut(&Line) -> bool {
     move |l| matches!(l, Line::Info(i) if i.state == s)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn owner_exit_stops_once_while_provider_close_is_blocked() {
+    let home = Home::new();
+    let id = "ownerlinux";
+    let h = host(Config {
+        id: id.into(),
+        kind: "fake".into(),
+        ..Config::default()
+    });
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let conn = Arc::new(BlockingClose {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        closes: AtomicUsize::new(0),
+    });
+    with_conn(&h, conn.clone());
+    h.lock().info.state = "working".into();
+
+    let mut owner = Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let owner_pid = owner.id() as i64;
+    let sock = sock_path(id);
+    let ln = listen_at(&sock).unwrap();
+    let home_path = home.path();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let h2 = h.clone();
+    let sock2 = sock.clone();
+    let server = std::thread::spawn(move || {
+        Home::enter(&home_path);
+        let result = h2.serve_kq(&ln, &sock2, Some(owner_pid));
+        let _ = done_tx.send(result);
+        result
+    });
+
+    // A replay line proves the epoll listener and pidfd registrations have
+    // completed before the owner is killed.
+    let mut client = UnixStream::connect(&sock).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    client
+        .write_all(b"{\"op\":\"hello\",\"proto\":11}\n")
+        .unwrap();
+    let mut lines = BufReader::new(client.try_clone().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = lines.read_line(&mut line).unwrap();
+        assert!(n > 0, "the host closed before sending its info");
+        if line.contains(r#""type":"agtop_info""#) {
+            break;
+        }
+    }
+    drop(lines);
+    drop(client);
+
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    let entered = entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .is_ok();
+    // A level-triggered pidfd used to enqueue another stop while close() was
+    // blocked, letting that second stop set quit and end the server early.
+    let exited_while_blocked = done_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+    let _ = release_tx.send(());
+    let result = join_within(server, Duration::from_secs(10));
+
+    crate::events::flush_test();
+    let stopping = std::fs::read_to_string(crate::paths::events_path(id))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["kind"] == "stopping")
+        .count();
+    let _ = std::fs::remove_file(&sock);
+
+    assert!(entered, "the provider close was never entered");
+    assert!(
+        !exited_while_blocked,
+        "the server exited while provider close was blocked"
+    );
+    assert_eq!(conn.closes.load(Ordering::SeqCst), 1);
+    assert_eq!(stopping, 1, "owner death requested more than one stop");
+    assert!(result, "the Linux wait did not finish normally");
 }
 
 // agent_test.go:76: a host runs any agent through its adapter: the

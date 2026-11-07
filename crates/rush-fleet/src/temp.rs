@@ -4,6 +4,7 @@
 //! diskusage_background.go (paced walks, heavy folders reused).
 
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::path::Path;
 use std::sync::Mutex;
@@ -449,14 +450,19 @@ fn stat_usage(dir: &str, pace: &mut Option<Pacer>) -> i64 {
 /// Folders that are huge, rarely change, and cost thousands of calls a
 /// walk: a background walk reuses one's last total while its own modified
 /// time holds and the total is under an hour old.
+#[cfg(target_os = "macos")]
 const HEAVY: &[&str] = &["node_modules", ".git", "target", ".venv", "venv", "Pods"];
+#[cfg(target_os = "macos")]
 const HEAVY_TTL: Duration = Duration::from_secs(3600);
 
 /// A heavy folder's modified time, when its total was counted, and it.
+#[cfg(target_os = "macos")]
 type Heavy = HashMap<String, (i128, Instant, i64)>;
 
+#[cfg(target_os = "macos")]
 static HEAVY_CACHE: Mutex<Option<Heavy>> = Mutex::new(None);
 
+#[cfg(target_os = "macos")]
 fn mtime_nanos(dir: &str) -> Option<i128> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::symlink_metadata(dir).ok()?;
@@ -465,6 +471,7 @@ fn mtime_nanos(dir: &str) -> Option<i128> {
 
 /// Whether dir is a heavy folder whose last total still holds; the stamp
 /// is its modified time, to store the new total under.
+#[cfg(target_os = "macos")]
 fn heavy_hit(dir: &str, pace: &Option<Pacer>) -> (i128, Option<i64>) {
     let name = dir.rsplit('/').next().unwrap_or(dir);
     if pace.is_none() || !HEAVY.contains(&name) {
@@ -483,6 +490,7 @@ fn heavy_hit(dir: &str, pace: &Option<Pacer>) -> (i128, Option<i64>) {
     (stamp, None)
 }
 
+#[cfg(target_os = "macos")]
 fn heavy_store(dir: &str, stamp: i128, total: i64) {
     if stamp == 0 {
         return;
@@ -508,6 +516,7 @@ fn dir_usage(dir: &str, pace: &mut Option<Pacer>) -> i64 {
     stat_usage(dir, pace) // a file system without it
 }
 
+#[cfg(target_os = "macos")]
 mod bulk {
     use super::*;
 
@@ -670,6 +679,23 @@ mod bulk {
         let sub =
             (typ == VDIR && !name.is_empty()).then(|| String::from_utf8_lossy(name).into_owned());
         Some((size, sub, next))
+    }
+}
+
+// getattrlistbulk is a macOS-only syscall. Linux and other Unix targets use
+// the existing descriptor-based stat walk above.
+#[cfg(not(target_os = "macos"))]
+mod bulk {
+    use super::*;
+
+    pub(super) fn usage(
+        _parent: libc::c_int,
+        _name: &str,
+        _dir: &str,
+        _buf: &mut [u8],
+        _pace: &mut Option<Pacer>,
+    ) -> Option<i64> {
+        None
     }
 }
 

@@ -57,6 +57,7 @@ fn grown() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn grown_replaced_and_missing() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("t.jsonl");
@@ -176,6 +177,7 @@ fn watcher_follows_missing_paths_in() {
     let w = Watcher::new();
     w.watch(&[&p]);
     assert!(!w.watching(&p));
+    #[cfg(target_os = "macos")]
     assert!(w.inner().missing.contains(&p));
     w.changes();
     // Its folder appears: a wait sleeps through that, as the file isn't
@@ -190,6 +192,7 @@ fn watcher_follows_missing_paths_in() {
     }
     assert!(w.watching(&p), "not watched once it appeared");
     assert!(w.changes().0.contains(&p), "its appearing wasn't told");
+    #[cfg(target_os = "macos")]
     assert!(w.inner().missing.is_empty());
     // A change to it wakes a wait as any other's does.
     append(&p, "x");
@@ -350,6 +353,7 @@ fn follow_misses_no_write() {
 // would: a folder's entries added, removed or renamed, a file written,
 // but not a file written deep inside a watched folder.
 #[test]
+#[cfg(target_os = "macos")]
 fn watcher_many() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("sessions");
