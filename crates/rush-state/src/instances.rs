@@ -265,14 +265,21 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn proc_args_keeps_empty_linux_arguments() {
+        use std::io::BufRead;
         let mut child = Command::new("sh")
             // Keep the shell itself alive on a pipe. A simple external
             // command lets dash optimize into that command, which drops the
             // shell's argv (including the empty $0) before /proc is read.
-            .args(["-c", "read _", ""])
+            .args(["-c", "printf 'ready\\n'; read _", ""])
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+        // The shell's own output establishes readiness before /proc is read.
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
         let args = proc_args(child.id() as i32);
         assert!(args.iter().any(|arg| arg.is_empty()), "arguments: {args:?}");
         let _ = child.kill();
