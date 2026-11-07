@@ -197,6 +197,14 @@ mod tests {
     fn replaces_a_host_and_carries_it_on() {
         let home = Home::new();
         let cfg = start(&home, "rp1");
+        // Init assigns the fresh fake's real conversation id asynchronously.
+        // Its later approval establishes that Init has been saved before
+        // replacement reads the existing conversation's configuration.
+        assert!(until(&home, "rp1", || {
+            read_info("rp1").is_ok_and(|i| i.session_id == "fake-session" && i.state == "blocked")
+        }));
+        let cfg = read_config(&cfg.id).unwrap();
+        assert!(!cfg.resume, "the replacement must enable resuming");
         let mut info = read_info("rp1").unwrap();
         info.limit = Some(Limit::default());
         replace_host(&info, true, &spawn_fake).unwrap();
