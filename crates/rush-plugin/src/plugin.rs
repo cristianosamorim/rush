@@ -516,9 +516,10 @@ pub(crate) mod tests {
     fn digest_is_gos() {
         // The digest Go rush computes for this folder (same names, modes and
         // contents), so approvals made by either verify in the other.
-        // Go's Digest gave this for the same folder (macOS, where a
-        // symlink's own mode is 0755): a dir, a link, a setuid program, and
-        // a name %q has to escape.
+        // The macOS golden came from Go's Digest for this fixture: a dir,
+        // a link, a setuid program, and a name %q has to escape. Linux's
+        // symlink mode is 0777, compared with macOS's 0755; the Linux CI
+        // checks its golden with the Go reference in tools/linux-digest.
         use std::os::unix::fs::PermissionsExt;
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("p");
@@ -535,10 +536,12 @@ pub(crate) mod tests {
         file("sub/a b\"c\té", "x", 0o600);
         file("Z", "zz", 0o4711);
         {
-            assert_eq!(
-                digest(&dir).unwrap(),
+            let want = if cfg!(target_os = "linux") {
+                "e4934c548213257be8808cd91de5e0e60e52ba97ade627d5d316053bdd48208d"
+            } else {
                 "2a6a77cd77b7eaf7696e6bc703d78817848009aff4a3ce42993da493a92c3524"
-            );
+            };
+            assert_eq!(digest(&dir).unwrap(), want);
         }
     }
 }

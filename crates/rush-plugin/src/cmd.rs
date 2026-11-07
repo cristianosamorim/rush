@@ -532,7 +532,7 @@ mod tests {
         m.description = "Does a thing.".into();
         install_plugin(&m, &[("bin", "#!/bin/sh\n")]);
         let (r, _) = run(&["approve", "p"], false, "");
-        {
+        if cfg!(target_os = "macos") {
             assert_eq!(r, Err("approving needs you at a terminal".into()));
             let (r, out) = run(&["approve", "p"], true, "n\n");
             assert!(
@@ -544,6 +544,15 @@ mod tests {
                 out.ends_with("\nValid, not approved. To run it: rush plugin approve p\n"),
                 "{out}"
             );
+        } else {
+            let unavailable = "plugins need a sandbox, and there isn't one on this system yet (macOS only for now)";
+            assert_eq!(r, Err(unavailable.into()));
+            let (r, out) = run(&["approve", "p"], true, "y\n");
+            assert_eq!(r, Err(unavailable.into()));
+            assert!(!out.contains("Let it run?"));
+            assert!(!approvals().contains_key("p"));
+            let (r, _) = run(&["check", "p"], false, "");
+            assert_eq!(r, Err(unavailable.into()));
         }
         crate::plugin::approve(&load(&crate::root().join("p")).unwrap()).unwrap();
         let (_, out) = run(&["list"], false, "");
