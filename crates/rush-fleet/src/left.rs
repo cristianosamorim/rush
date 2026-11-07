@@ -112,7 +112,9 @@ fn look_left_one(mut it: LeftItem) -> LeftItem {
     let b = born(&it.path);
     let began = born(&host_root().join(&it.agent.job.id).to_string_lossy());
     it.before = match (b, began) {
-        (Some(b), Some(began)) => b < began,
+        // Linux can give adjacent creations the same timestamp. Equality
+        // does not prove the agent made the path, so keep it in that case.
+        (Some(b), Some(began)) => b < began || cfg!(target_os = "linux") && b == began,
         _ => true,
     };
     let (size, newest) = scratch_walk(&it.path);

@@ -170,17 +170,40 @@ fn remove_one_temp_entry() {
     assert_eq!(left, ["b"]);
 }
 
+// Make the fixture's creation order observable at filesystem resolution.
+fn create_dir_after(path: &Path, older: &Path) {
+    let older = crate::left::born(&s(older)).expect("fixture birth time");
+    let end = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        std::fs::create_dir(path).unwrap();
+        let born = crate::left::born(&s(path)).expect("fixture birth time");
+        if born > older {
+            return;
+        }
+        // Establish observable filesystem ordering; adjacent mkdirs may
+        // otherwise have equal birth times even though they ran in order.
+        std::fs::remove_dir(path).unwrap();
+        assert!(
+            std::time::Instant::now() < end,
+            "birth time did not advance: {born:?} after {older:?}"
+        );
+        std::thread::yield_now();
+    }
+}
+
 // What a finished agent made in a temp folder can go; what was there
-// before it, what's changed since, and anything nested are kept or
-// folded.
+// before it, what's changed since, and anything nested are kept or folded.
 #[test]
 fn look_left_classes() {
     let _h = RushHome::new();
     let tmp = tempfile::tempdir_in("/tmp").unwrap(); // a system temp folder, whatever runs the test
     let before = tmp.path().join("before");
     std::fs::create_dir(&before).unwrap();
-    std::fs::create_dir_all(host_root().join("s1")).unwrap(); // the session begins
+    std::fs::create_dir_all(host_root()).unwrap();
+    let session = host_root().join("s1");
+    create_dir_after(&session, &before); // the session begins
     let made = tmp.path().join("clone");
+    create_dir_after(&made, &session);
     std::fs::create_dir_all(made.join("sub")).unwrap();
     let left = |p: &Path| Left {
         path: s(p),
@@ -219,6 +242,32 @@ fn look_left_classes() {
         !(it[0].path == s(&made) && it[0].safe()),
         "touched since, yet safe"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn equal_birth_times_do_not_allow_leftover_removal() {
+    let home = RushHome::new();
+    let candidate = home.0.path().join("pre-existing");
+    std::fs::write(&candidate, "keep").unwrap();
+    std::fs::create_dir_all(host_root()).unwrap();
+    // A hard link forces identical birth times without relying on the
+    // filesystem clock's resolution. This fixture only needs session metadata.
+    std::fs::hard_link(&candidate, host_root().join("s1")).unwrap();
+    assert!(crate::left::born(&s(&candidate)).is_some());
+    let mut agent = Agent {
+        left: vec![Left {
+            path: s(&candidate),
+            ..Left::default()
+        }],
+        ..Agent::default()
+    };
+    agent.job.id = "s1".into();
+    agent.job.updated_at = now();
+    let items = look_left(&[agent]);
+    assert!(items[0].before && !items[0].safe());
+    assert!(remove_left(&items[0]).is_err());
+    assert_eq!(std::fs::read_to_string(candidate).unwrap(), "keep");
 }
 
 // Only what nothing has touched, anywhere inside, for a day goes.
