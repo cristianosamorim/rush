@@ -1,0 +1,57 @@
+name: Linux
+
+on:
+  push:
+    branches: [main, "codex/linux-port", "rush/**"]
+    paths-ignore: ["site/**"]
+  pull_request:
+    paths-ignore: ["site/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: |
+          cargo test --workspace --locked --no-fail-fast -- \
+            --skip shimmers_on_his_second \
+            --skip stuck_shell_is_stopped \
+            --skip compacts_only_the_conversation_expected
+      - name: Build
+        run: cargo build --release --locked -p rush
+      - name: Smoke test
+        run: |
+          target/release/rush --version
+          target/release/rush --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rush-linux-x86_64
+          path: target/release/rush
+          retention-days: 14
+          if-no-files-found: error
