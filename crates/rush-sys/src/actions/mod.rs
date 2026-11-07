@@ -328,12 +328,10 @@ pub fn notify(title: &str, body: &str) {
                 let _ = c.wait();
             });
         }
-        return;
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
     {
         let _ = (title, body);
-        return;
     }
     #[cfg(target_os = "macos")]
     {

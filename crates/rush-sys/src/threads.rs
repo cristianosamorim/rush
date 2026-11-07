@@ -209,7 +209,7 @@ pub fn names() -> Vec<String> {
             .map(|name| name.trim_end_matches(['\r', '\n']).to_string())
             .collect::<Vec<_>>();
         out.sort_unstable();
-        return out;
+        out
     }
     #[cfg(target_os = "macos")]
     {

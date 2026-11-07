@@ -36,7 +36,7 @@ pub fn transcripts<P: AsRef<Path>>(dirs: &[P], idle: Duration) -> Pass {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (dirs, idle);
-        return Pass::default();
+        Pass::default()
     }
     #[cfg(target_os = "macos")]
     {
