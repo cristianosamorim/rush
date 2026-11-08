@@ -1618,6 +1618,7 @@ dependencies = [
 name = "rush-plugin-probe"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rush-plugin-sdk",
  "serde_json",
 ]

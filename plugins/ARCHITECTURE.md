@@ -48,8 +48,39 @@ This is the inside view: the processes, what crosses each boundary, and why it i
 
 - **Session host** (`rush host run <id>`, one per rush-mode session, already there before plugins). When it starts Claude Code, it reads `approved.json` and adds the approved plugins' subagents (`--agents`) and prompt text (`--append-system-prompt`). It registers each plugin's tools as an in-process MCP server, `rush-<name>`, the same way rush's own `mcp__rush__show` works. When Claude Code sends an `mcp_message` for one, the host passes it to the broker on a thread of its own and replies with the answer. The session never blocks on a plugin.
 - **Broker** (`rush plugind`). There's one per machine, held by `flock`. Hosts start it when a plugin is approved, and it exits once none is. It runs every approved plugin, answers hosts, and checks every call a plugin makes.
-- **Plugin**, one process per plugin, shared by every session. It runs as `taskpolicy -c utility sandbox-exec -p <profile> <program>`.
+- **Plugin**, one instance per plugin, shared by every session. macOS runs it as `taskpolicy -c utility sandbox-exec -p <profile> <program>`; Linux runs it in Bubblewrap namespaces with the seccomp barrier described below.
 - **Proxy**: one per plugin with `network`, inside the broker. It's the plugin's only way out.
+
+### Linux sandbox processes
+
+The diagram's `sandbox-exec` boxes become a Bubblewrap wrapper and private
+namespace on Linux. The wrapper stays in the broker-created process group;
+its death ends the namespace. The broker measures the whole descendant
+tree, including the real plugin and its optional network helper.
+
+The initial executable is Rush itself, reentered in a narrow trusted
+bootstrap. Bubblewrap and that bootstrap receive a clean environment;
+manifest variables reach only the final plugin exec. The bootstrap
+installs a seccomp user-notification filter. A descriptor sent to the
+parent authorizes exactly the first exec by this single-threaded trusted
+code. Both sides close their listener references, so subsequent execs
+receive ENOSYS. The inherited filter also denies replacing seccomp,
+forking processes, entering namespaces, process injection, and new Unix
+pathname sockets. Runtime threads and connected stream self-pipes work.
+
+Approved read paths and runtime libraries are read-only bind mounts;
+data and approved write paths are writable binds. The synthetic root and
+private procfs are read-only. The latter prevents injecting Bubblewrap's
+unfiltered PID-1 reaper through `/proc/1/mem` even with permissive Yama.
+
+With `network`, a trusted nondumpable helper listens on private loopback.
+It forks before the exec listener exists and never holds plugin IPC.
+Accepted sockets cross an inherited descriptor channel to the parent,
+which connects only to the existing per-plugin proxy. The plugin holds
+neither that channel nor a route out of the namespace. The host relay
+acquires one of 64 connection permits before opening host sockets or
+starting workers; channel closure shuts down all tunnels. The existing
+CONNECT proxy remains responsible for host approval and DNS/IP checks.
 
 ## One tool call, end to end
 
@@ -103,7 +134,7 @@ Each boundary is enforced by something the plugin can't touch.
 - **A socket pair on fd 3.** It has no path, so there's nothing to find, guess or race for. It needs no auth handshake, and the sandbox can keep denying every socket. One connected stream per plugin is also the fastest local transport there is. A tool call's round trip through the host, broker and plugin costs tens of microseconds, next to model calls measured in seconds.
 - **Length-prefixed JSON-RPC.** Reading a message takes two reads with no scanning, and the size is capped at 16 MB before anything is allocated. JSON-RPC is what MCP already speaks, so tool calls pass through almost untouched, and a plugin can be written in anything, with no code generation or schema compiler. Shared memory or protobuf would add a dependency, and room for bugs, to save time that doesn't matter here.
 - **MCP plugins as they are.** Any MCP server works without changes: the broker is its one MCP client, and gives each call its own id. That's how the memory example is the reference server, unmodified.
-- **`sandbox-exec`.** It's the one sandbox on macOS that needs no root, entitlements or signing. Apple has deprecated the command-line tool but still ships it, and Claude Code relies on it too. Where there's no sandbox, as on Linux, `Supported()` refuses to run installed plugins. Bundled plugins (`crates/rush-plugin/src/bundled.rs`, and their code in `crates/rush-bundled`) are rush's own code: the broker runs them as `rush plugin run <name>`, unsandboxed, on every system, over the same fd 3 protocol and capability checks.
+- **Platform sandboxes.** macOS uses `sandbox-exec`, without root, entitlements or signing. Linux GNU uses Bubblewrap with user, mount, PID, IPC, UTS and network namespaces, plus seccomp. `supported()` probes the actual backend and refuses installed plugins when it cannot isolate them. Bundled plugins (`crates/rush-plugin/src/bundled.rs`, and their code in `crates/rush-bundled`) are Rush's own code: the broker runs them as `rush plugin run <name>`, unsandboxed, on every system, over the same fd 3 protocol and capability checks.
 
 ## Files
 
@@ -112,7 +143,7 @@ Each boundary is enforced by something the plugin can't touch.
 | `crates/rush-plugin/src/manifest.rs` | The manifest and its validation |
 | `crates/rush-plugin/src/plugin.rs` | Loading, the digest, approvals, and `for_session` (what hosts add to Claude Code) |
 | `crates/rush-plugin/src/rpc.rs` | The JSON-RPC connection: framed (fd 3) and line (MCP stdio) codecs, concurrent calls both ways |
-| `crates/rush-plugin/src/sandbox.rs` | The plugin's environment, the sandbox profile, and the `taskpolicy`/`sandbox-exec` command; a refusal elsewhere |
+| `crates/rush-plugin/src/sandbox.rs`, `sandbox/linux*` | The clean environment and platform sandbox: macOS profile, or Linux mount layout, one-shot exec authorization and bounded proxy relay |
 | `crates/rush-plugin/src/proxy.rs` | The per-plugin CONNECT proxy |
 | `crates/rush-plugin/src/client.rs` | The host's side: finding and starting the broker, and forwarding MCP messages |
 | `crates/rush-plugin/src/sidebar.rs` | Checking and keeping a plugin's `sidebar.set`, and reading it back for the list |

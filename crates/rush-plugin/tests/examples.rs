@@ -12,7 +12,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rush_plugin::rpc::{Handler, no_method, to_raw};
@@ -138,6 +138,42 @@ fn stop(mut child: std::process::Child, conn: Conn) {
     let _ = child.wait();
 }
 
+/// CI asks for a real plugin sandbox. Other platforms keep the existing
+/// opt-in behaviour so a missing local sandbox does not make the examples
+/// require an external runtime.
+fn sandbox_is_required() -> bool {
+    (cfg!(target_os = "linux") && std::env::var_os("CI").is_some())
+        || std::env::var_os("RUSH_TEST_REQUIRE_PLUGIN_SANDBOX").is_some()
+        || std::env::var_os("PLUGIN_SANDBOX_REQUIRED").is_some()
+}
+
+#[test]
+fn required_plugin_sandbox_is_available() {
+    if sandbox_is_required() {
+        rush_plugin::supported().unwrap_or_else(|e| panic!("plugin sandbox required: {e}"));
+    }
+}
+
+/// Waits for a file predicate without sleeping. The plugin's writer gets
+/// scheduled by yielding, and a deadline keeps a broken child from hanging
+/// the test forever.
+fn wait_for_file(path: &Path, want: impl Fn(&str) -> bool) -> String {
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && want(&text)
+        {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "{} did not reach the expected contents",
+            path.display()
+        );
+        std::thread::yield_now();
+    }
+}
+
 /// The plugins in the repository load, each under a category.
 #[test]
 fn repo_plugins_load() {
@@ -239,6 +275,148 @@ fn reconnect_speaks_the_protocol() {
     stop(child, conn);
 }
 
+/// autodrafts runs through the real sandbox, handles UI input, persists a
+/// draft, restores it through a UI request, and reads it back after restart.
+#[test]
+fn autodrafts_persists_and_restores_through_the_sandbox() {
+    if rush_plugin::supported().is_err() {
+        return;
+    }
+    let _h = Home::new();
+    let dir = install_example("autodrafts");
+    let data = rush_plugin::data_dir("autodrafts");
+    std::fs::create_dir_all(&data).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+    let seen = calls.clone();
+    let h: Handler = Arc::new(move |_, _, method, p| {
+        let params = p
+            .map(|p| serde_json::from_str::<Value>(p.get()).unwrap())
+            .unwrap_or(Value::Null);
+        seen.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((method.to_string(), params));
+        match method {
+            "ui.input.set" | "ui.notify" => to_raw(&json!({})).map(Some),
+            m => Err(no_method(m)),
+        }
+    });
+
+    let (child, conn) = start(&dir, 0, h);
+    let ctx = Ctx::background().with_timeout(Duration::from_secs(20));
+    conn.call::<_, Value>(
+        &ctx,
+        "initialize",
+        &json!({"dataDir": data, "settings": {"keep": "10"}}),
+    )
+    .unwrap();
+    conn.notify(
+        "ui.event",
+        &json!({
+            "kind": "input.changed",
+            "ui": "w1",
+            "session": {"id": "s1", "name": "Draft session"},
+            "text": "persist me"
+        }),
+    )
+    .unwrap();
+    conn.notify(
+        "ui.event",
+        &json!({
+            "kind": "input.cleared",
+            "ui": "w1",
+            "session": {"id": "s1", "name": "Draft session"},
+            "text": "persist me"
+        }),
+    )
+    .unwrap();
+    let path = data.join("drafts.json");
+    wait_for_file(&path, |s| s.contains("persist me"));
+    conn.call::<_, Value>(
+        &ctx,
+        "ui.command",
+        &json!({
+            "command": "restore",
+            "ui": "w1",
+            "session": {"id": "s1", "name": "Draft session"}
+        }),
+    )
+    .unwrap();
+    let calls_now = calls.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        calls_now.iter().any(|(method, p)| {
+            method == "ui.input.set" && p["text"] == "persist me" && p["session"] == "s1"
+        }),
+        "restore did not set the input: {calls_now:?}"
+    );
+    drop(calls_now);
+    // Keep a second copy so the restarted process exercises a non-empty
+    // on-disk draft after the first restore consumed one.
+    conn.notify(
+        "ui.event",
+        &json!({
+            "kind": "input.changed",
+            "ui": "w1",
+            "session": {"id": "s1", "name": "Draft session"},
+            "text": "persist me"
+        }),
+    )
+    .unwrap();
+    conn.notify(
+        "ui.event",
+        &json!({
+            "kind": "input.cleared",
+            "ui": "w1",
+            "session": {"id": "s1", "name": "Draft session"},
+            "text": "persist me"
+        }),
+    )
+    .unwrap();
+    wait_for_file(&path, |s| s.contains("persist me"));
+    stop(child, conn);
+
+    // A fresh process must load the same data folder, not just its parent's
+    // in-memory Book.
+    let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+    let seen = calls.clone();
+    let h: Handler = Arc::new(move |_, _, method, p| {
+        let params = p
+            .map(|p| serde_json::from_str::<Value>(p.get()).unwrap())
+            .unwrap_or(Value::Null);
+        seen.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((method.to_string(), params));
+        match method {
+            "ui.input.set" | "ui.notify" => to_raw(&json!({})).map(Some),
+            m => Err(no_method(m)),
+        }
+    });
+    let (child, conn) = start(&dir, 0, h);
+    conn.call::<_, Value>(
+        &ctx,
+        "initialize",
+        &json!({"dataDir": data, "settings": {"keep": "10"}}),
+    )
+    .unwrap();
+    conn.call::<_, Value>(
+        &ctx,
+        "ui.command",
+        &json!({
+            "command": "restore",
+            "ui": "w1",
+            "session": {"id": "s1", "name": "Draft session"}
+        }),
+    )
+    .unwrap();
+    let calls_now = calls.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        calls_now.iter().any(|(method, p)| {
+            method == "ui.input.set" && p["text"] == "persist me" && p["session"] == "s1"
+        }),
+        "restart did not restore the persisted input: {calls_now:?}"
+    );
+    stop(child, conn);
+}
+
 /// Runs a real plugin in the real sandbox and has it try to get out: read
 /// your files, write outside its data folder, start a program, reach the
 /// internet, localhost or rush's own sockets.
@@ -250,9 +428,63 @@ fn sandbox_holds() {
     let home = Home::new();
     let dir = rush_plugin::root().join("probe");
     std::fs::create_dir_all(&dir).unwrap();
+    let data = rush_plugin::data_dir("probe");
+    #[cfg(target_os = "linux")]
+    let outside_preload = home.path().join("preload-outside");
+    #[allow(unused_mut)]
+    let mut manifest = json!({
+        "name": "probe",
+        "command": ["probe"],
+        "network": ["example.com:443"]
+    });
+    #[cfg(target_os = "linux")]
+    {
+        // This constructor must run only after the sandbox has been applied:
+        // its data marker is allowed, while the second path is not.
+        let source = dir.join("preload.c");
+        let library = dir.join("preload.so");
+        std::fs::write(
+            &source,
+            r#"#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void mark(const char *path) {
+    if (path == NULL) return;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        (void)write(fd, "loaded\n", 7);
+        (void)close(fd);
+    }
+}
+
+__attribute__((constructor)) static void rush_preload(void) {
+    mark(getenv("RUSH_PRELOAD_ALLOWED"));
+    mark(getenv("RUSH_PRELOAD_OUTSIDE"));
+}
+"#,
+        )
+        .unwrap();
+        let cc = Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .output()
+            .expect("Linux CI needs cc for the loader-env sandbox probe");
+        assert!(
+            cc.status.success(),
+            "cc preload: {}",
+            String::from_utf8_lossy(&cc.stderr)
+        );
+        manifest["env"] = json!({
+            "LD_PRELOAD": "${PLUGIN}/preload.so",
+            "RUSH_PRELOAD_ALLOWED": "${DATA}/preload-loaded",
+            "RUSH_PRELOAD_OUTSIDE": outside_preload.to_string_lossy()
+        });
+    }
     std::fs::write(
         dir.join("plugin.json"),
-        r#"{"name":"probe","command":["probe"],"network":["example.com:443"]}"#,
+        rush_state::json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
     cargo_build("rush-plugin-probe", "probe", &dir.join("probe"));
@@ -268,7 +500,6 @@ fn sandbox_holds() {
     let h: Handler = Arc::new(|_, _, m, _| Err(no_method(m)));
     let (child, conn) = start(&dir, proxy.port(), h);
     let ctx = Ctx::background().with_timeout(Duration::from_secs(20));
-    let data = rush_plugin::data_dir("probe");
     let got: std::collections::BTreeMap<String, String> = conn
         .call(
             &ctx,
@@ -279,6 +510,16 @@ fn sandbox_holds() {
             }),
         )
         .unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        let marker = data.join("preload-loaded");
+        wait_for_file(&marker, |s| s == "loaded\n");
+        assert!(
+            !outside_preload.exists(),
+            "loader env escaped the sandbox: {}",
+            outside_preload.display()
+        );
+    }
     for (k, want) in [
         ("read secret", "denied"),
         ("write outside", "denied"),
@@ -289,6 +530,23 @@ fn sandbox_holds() {
         ("rush socket", "denied"),
         ("write data", "allowed"),
         ("proxy", "allowed"),
+        ("proxy policy", "allowed"),
+    ] {
+        let v = got.get(k).cloned().unwrap_or_default();
+        assert!(v.starts_with(want), "{k}: {v}, want {want}");
+    }
+    #[cfg(target_os = "linux")]
+    for (k, want) in [
+        ("execve", "denied"),
+        ("execveat absolute", "denied"),
+        ("new seccomp listener", "denied"),
+        ("prctl seccomp", "denied"),
+        ("unix socket", "denied"),
+        ("unix datagram pair", "denied"),
+        ("unix stream reconnect", "denied"),
+        ("proc init write", "denied"),
+        ("proc readonly", "allowed"),
+        ("io_uring", "denied"),
     ] {
         let v = got.get(k).cloned().unwrap_or_default();
         assert!(v.starts_with(want), "{k}: {v}, want {want}");

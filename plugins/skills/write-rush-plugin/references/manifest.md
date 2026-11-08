@@ -64,11 +64,11 @@ These values are fixed; the manifest can't change them:
 }
 ```
 
-**Python / Node** (Homebrew's interpreter; its libraries are readable automatically):
+**Python / Node** (name the absolute interpreter path, such as the output of `command -v`; its libraries are readable automatically):
 
 ```json
-{ "command": ["/opt/homebrew/bin/python3", "-I", "plugin.py"] }
-{ "command": ["/opt/homebrew/bin/node", "plugin.mjs"] }
+{ "command": ["/usr/bin/python3", "-I", "plugin.py"] }
+{ "command": ["/usr/bin/node", "plugin.mjs"] }
 ```
 
 **An off-the-shelf MCP server** (`npm install @modelcontextprotocol/server-memory` inside the plugin folder):
@@ -78,7 +78,7 @@ These values are fixed; the manifest can't change them:
   "name": "memory",
   "description": "A knowledge graph Claude keeps across sessions.",
   "protocol": "mcp",
-  "command": ["/opt/homebrew/bin/node", "node_modules/@modelcontextprotocol/server-memory/dist/index.js"],
+  "command": ["/usr/bin/node", "node_modules/@modelcontextprotocol/server-memory/dist/index.js"],
   "env": { "MEMORY_FILE_PATH": "${DATA}/memory.jsonl" },
   "prompt": "You have a long-term memory in the mcp__rush-memory__* tools. Search it at the start of a task; record durable facts."
 }

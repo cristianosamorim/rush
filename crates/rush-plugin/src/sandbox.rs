@@ -1,5 +1,4 @@
-//! Starting a plugin: its environment, its process, and on macOS the
-//! sandbox-exec profile it runs in.
+//! Starting a plugin: its environment, process, and platform sandbox.
 //! Ported from internal/plugin/sandbox.go, sandbox_darwin.go and
 //! sandbox_other.go (a bundled plugin's rush found as sandbox.go:79 finds
 //! it, selfexe.Path).
@@ -13,9 +12,19 @@ use crate::gopath;
 use crate::manifest::{PROTO_RUSH, eval_symlinks, expand_home};
 use crate::plugin::Plugin;
 
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod linux;
+
+#[cfg(not(target_os = "linux"))]
 const ERR_NO_SANDBOX: &str =
-    "plugins need a sandbox, and there isn't one on this system yet (macOS only for now)";
+    "plugins need a sandbox; this system needs macOS sandbox-exec or the Linux bubblewrap backend";
+#[cfg(not(target_os = "linux"))]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+#[cfg(not(target_os = "linux"))]
 const TASK_POLICY: &str = "/usr/sbin/taskpolicy";
 
 /// How to start one plugin.
@@ -26,13 +35,34 @@ pub struct Launch {
     pub proxy_port: u16,
 }
 
-/// Says whether plugins can run here: only where they can be sandboxed,
-/// which so far is macOS.
+/// Plugins run only when their platform's sandbox is available. Linux
+/// probes its namespace/seccomp prerequisites and fails closed.
 pub fn supported() -> Result<(), String> {
-    if std::fs::metadata(SANDBOX_EXEC).is_ok() {
-        return Ok(());
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        linux::supported()
     }
-    Err(ERR_NO_SANDBOX.into())
+    #[cfg(all(
+        target_os = "linux",
+        not(all(
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))
+    ))]
+    {
+        Err("Linux plugins require a GNU x86_64 or aarch64 build with bubblewrap".into())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if std::fs::metadata(SANDBOX_EXEC).is_ok() {
+            return Ok(());
+        }
+        Err(ERR_NO_SANDBOX.into())
+    }
 }
 
 /// p with its links followed, or cleaned when it isn't there.
@@ -223,6 +253,33 @@ impl Launch {
     /// wires up its stdio and extra files (fd 3: see with_ipc_fd). A
     /// plugin never runs unsandboxed.
     pub fn command(&self) -> Result<Command, String> {
+        #[cfg(all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            linux::command(self)
+        }
+        #[cfg(all(
+            target_os = "linux",
+            not(all(
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))
+        ))]
+        {
+            supported()?;
+            Err("Linux plugin backend unavailable".into())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.macos_command()
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn macos_command(&self) -> Result<Command, String> {
         supported()?;
         let data = crate::data_dir(&self.plugin.name);
         crate::mkdir_all(&data.join("tmp"))?;
@@ -255,23 +312,38 @@ impl Launch {
 /// broker, say, letting it speak as that plugin. Go holds
 /// syscall.ForkLock over both instead.
 pub fn keep_only_stdio(cmd: &mut Command) {
-    let max = open_max();
-    // SAFETY: fcntl is async-signal-safe, as pre_exec needs.
+    #[cfg(target_os = "linux")]
+    // No artificial descriptor ceiling: a plugin must not inherit a
+    // broker channel opened above the old 65536-descriptor scan limit.
     unsafe {
-        cmd.pre_exec(move || {
-            for fd in 3..max {
-                let fl = libc::fcntl(fd, libc::F_GETFD);
-                if fl >= 0 && fl & libc::FD_CLOEXEC == 0 {
-                    libc::fcntl(fd, libc::F_SETFD, fl | libc::FD_CLOEXEC);
-                }
+        cmd.pre_exec(|| {
+            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 4u32) < 0 {
+                return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let max = open_max();
+        // SAFETY: fcntl is async-signal-safe, as pre_exec needs.
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in 3..max {
+                    let fl = libc::fcntl(fd, libc::F_GETFD);
+                    if fl >= 0 && fl & libc::FD_CLOEXEC == 0 {
+                        libc::fcntl(fd, libc::F_SETFD, fl | libc::FD_CLOEXEC);
+                    }
+                }
+                Ok(())
+            });
+        }
     }
 }
 
 /// One past the highest descriptor this process may have open, bounded so
 /// a limit of "unlimited" doesn't mean looking at billions.
+#[cfg(not(target_os = "linux"))]
 fn open_max() -> libc::c_int {
     const CAP: libc::rlim_t = 1 << 16;
     let mut rl = libc::rlimit {
@@ -288,15 +360,24 @@ fn open_max() -> libc::c_int {
 /// Hands fd to the process cmd starts as its fd 3, where a plugin speaking
 /// rush's protocol finds its end of the socket pair (Go's ExtraFiles).
 pub fn with_ipc_fd(cmd: &mut Command, fd: std::os::fd::RawFd) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // Reserve a distinct source before any pre_exec hook maps fd4/fd5.
+    // Capturing ownership also keeps it live until spawn (or cmd drop).
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 16) };
+    let source = if dup < 0 {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(dup) })
+    };
     // SAFETY: dup2 and fcntl are async-signal-safe, as pre_exec needs.
     unsafe {
         cmd.pre_exec(move || {
-            if fd == 3 {
-                let fl = libc::fcntl(3, libc::F_GETFD);
-                if fl < 0 || libc::fcntl(3, libc::F_SETFD, fl & !libc::FD_CLOEXEC) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            } else if libc::dup2(fd, 3) < 0 {
+            let source = source
+                .as_ref()
+                .map_err(|&code| std::io::Error::from_raw_os_error(code))?;
+            if libc::dup2(source.as_raw_fd(), 3) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -440,5 +521,52 @@ mod tests {
             "writes = {writes}"
         );
         assert!(!prof.contains("network-outbound"), "no proxy, no network");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closes_high_descriptors_and_preserves_only_the_mapped_ipc() {
+        use std::io::Read;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::net::UnixStream;
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let high = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 70_000) };
+        if high < 0 {
+            // If the process limit is below the former scan ceiling,
+            // there cannot be an open descriptor beyond that ceiling.
+            assert!(matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINVAL | libc::EMFILE)
+            ));
+            return;
+        }
+        let _high = unsafe { OwnedFd::from_raw_fd(high) };
+        let (mut mine, theirs) = UnixStream::pair().unwrap();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "test ! -e /proc/self/fd/$1 && printf ipc >&3",
+            "sh",
+            &high.to_string(),
+        ]);
+        keep_only_stdio(&mut cmd);
+        // Deliberately clobber the caller's original IPC source before
+        // with_ipc_fd's hook. Its reserved parent duplicate must survive.
+        let original = theirs.as_raw_fd();
+        let null = file.as_raw_fd();
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(null, original) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        with_ipc_fd(&mut cmd, original);
+        assert!(cmd.status().unwrap().success());
+        drop(theirs);
+        let mut buf = [0; 3];
+        mine.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ipc");
     }
 }

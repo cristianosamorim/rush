@@ -254,11 +254,19 @@ impl Broker {
                     let Some(p) = table.procs.get(&r.pid_now()) else {
                         continue;
                     };
+                    // bubblewrap is the immediate child on Linux. Count
+                    // its sandboxed descendants too, rather than only the
+                    // small monitor process. fill() loads their metrics;
+                    // it does not aggregate them into the parent's Proc.
+                    #[cfg(target_os = "linux")]
+                    let footprint = table.sum(p.pid, &std::collections::HashSet::<i32>::new()).0;
+                    #[cfg(not(target_os = "linux"))]
+                    let footprint = p.footprint;
                     let limit = r.live().0.memory();
-                    if p.footprint > limit {
+                    if footprint > limit {
                         r.fail(&format!(
                             "using {} MB, over its {} MB limit",
-                            p.footprint >> 20,
+                            footprint >> 20,
                             limit >> 20
                         ));
                     }

@@ -11,5 +11,6 @@ name = "probe"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 rush-plugin-sdk = { path = "../../../../../plugins/sdk" }
 serde_json = "1"

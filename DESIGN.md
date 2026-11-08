@@ -133,8 +133,29 @@ ownership and keeps the path; coarse filesystem timestamps must not make a
 pre-existing path eligible for automatic removal.
 
 Installed plugins must keep the sandbox contract: Linux support must
-never turn a missing macOS sandbox into unsandboxed execution. The
-existing refusal remains; bundled plugins use their existing broker.
+never turn a missing sandbox into unsandboxed execution. Linux GNU
+x86_64/aarch64 builds use Bubblewrap's private mount, user, PID, IPC,
+UTS and network namespaces. Only approved paths and runtime libraries
+are mounted; the synthetic root and private procfs are read-only.
+A trusted early bootstrap installs a seccomp filter and sends its
+notification listener to the parent. The parent permits exactly its
+first exec, then closes the final listener, so subsequent execs fail.
+Installing a replacement seccomp filter is denied. Manifest environment
+variables are applied only at the final exec, never to Bubblewrap or
+the trusted bootstrap. The GNU `.init_array.00100` bootstrap dispatch
+runs after libstd's argument initializer and before test-home constructors;
+it also lets integration test executables reenter this isolated path.
+The filter accepts only the native 64-bit ABI and caps its syscall range
+at Linux 6.8's last native syscall; extending that range requires review.
+Numbers beyond the range return ENOSYS so optional runtime calls can fall back.
+Network plugins have a nondumpable helper inside their private network
+namespace. It passes accepted sockets to a bounded host relay, which
+connects only to that plugin's existing CONNECT proxy. The plugin never
+inherits this control channel. Its process tree's RSS is checked against
+`memoryMB`, including the wrapper and helper. Missing namespace, seccomp
+or AppArmor prerequisites are a preflight error; bundled plugins keep
+their existing broker path. The six examples, including the actual Node
+MCP memory server across restart, run in Linux CI.
 
 Tests still run on GitHub CI. The test-home constructor uses Mach-O's
 `__mod_init_func` on macOS and ELF's `.init_array` on Linux, before any

@@ -20,6 +20,10 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # Plugin examples must exercise the Linux sandbox in CI; an unsupported
+  # backend is a failure, not a reason for the integration tests to skip.
+  PLUGIN_SANDBOX_REQUIRED: "1"
+  RUSH_TEST_REQUIRE_PLUGIN_SANDBOX: "1"
 
 jobs:
   check:
@@ -27,6 +31,24 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux plugin sandbox prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap apparmor-profiles build-essential
+          profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          if test -d /sys/module/apparmor && test -f "$profile"; then
+            sudo apparmor_parser -r "$profile"
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Prepare the memory example
+        env:
+          MEMORY_PLUGIN_DIR: ${{ runner.temp }}/rush-memory-plugin
+        run: |
+          bash plugins/examples/memory/install.sh "$MEMORY_PLUGIN_DIR"
+          echo "MEMORY_PLUGIN_DIR=$MEMORY_PLUGIN_DIR" >> "$GITHUB_ENV"
+          echo "RUSH_MEMORY_PLUGIN_DIR=$MEMORY_PLUGIN_DIR" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.98.1"

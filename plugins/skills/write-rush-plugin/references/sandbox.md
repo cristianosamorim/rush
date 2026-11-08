@@ -1,19 +1,20 @@
 # The sandbox
 
-Each plugin runs as `taskpolicy -c utility sandbox-exec -p <profile> <program>`: at utility QoS, so it yields the CPU to the user and their agents, and in a macOS sandbox profile that starts from `(deny default)`.
+On macOS each plugin runs as `taskpolicy -c utility sandbox-exec -p <profile> <program>`: at utility QoS, in a profile starting from `(deny default)`. Linux GNU uses Bubblewrap namespaces and seccomp, with the same approved-file and proxy boundaries. [Linux setup](../../../../docs/linux.md#external-plugins) lists the prerequisites; an unavailable sandbox always prevents execution.
 
 ## Allowed
 
-- **Execute:** its program only. For a framework Python (Homebrew's or python.org's), the interpreter `bin/python3` hands over to is allowed as well.
+- **Execute:** its approved initial program only. macOS also allows a framework Python's handover to its real interpreter. On Linux, every exec after the initial launch is blocked, including re-exec of the same program. Name an interpreter explicitly in `command`; avoid shell wrappers and `#!/usr/bin/env` handovers.
 - **Read:**
   - its plugin folder and its data folder;
   - the system's libraries (`/usr/lib`, `/usr/share`, `/System`, the dyld cache, time zones, `/private/etc/ssl`);
   - for a program under `/opt/homebrew` or `/usr/local`: that prefix's `Cellar`, `opt`, `lib`, `etc/openssl@3` and `etc/ca-certificates`;
   - the paths in `read` and `write`.
-- **Look up metadata (stat) anywhere.** Loaders need it. The plugin can learn that a file exists and how big it is, never what's in it.
+- **Look up metadata:** macOS allows stat anywhere without reading content. Linux exposes metadata only within the mounted namespace. Both provide the system runtime libraries needed by their loaders.
 - **Write:** its data folder, the paths in `write`, and `/dev/null`.
 - **Connect:** `127.0.0.1:<its proxy's port>`, and only when it has `network`.
 - A little more: sysctl reads, and the one system service libSystem looks up at start.
+- Linux language runtimes may create threads and connected Unix stream socket pairs for self-pipes. They cannot create pathname/abstract Unix sockets or reconnect a stream pair to another endpoint.
 
 ## Denied
 
@@ -30,6 +31,15 @@ Everything else, including:
 With `network`, `HTTPS_PROXY` and friends point at an HTTP CONNECT proxy the broker runs for this plugin alone. It tunnels only to the exact `host:port` pairs approved. It resolves the name itself and refuses loopback, private, link-local and CGNAT addresses, so an approved name can't be pointed at the user's machine or network. Plain-HTTP proxying isn't offered; use HTTPS.
 
 Most HTTP clients honour `HTTPS_PROXY`: Rust's `reqwest`, Go's `net/http`, Python's `urllib` and `requests`, `curl`-based libraries. So does Node 24+ with `NODE_USE_ENV_PROXY=1`, which rush sets; that covers `fetch` and `https`. A client that ignores proxy variables can't connect at all, which is the right failure.
+
+Linux gives each plugin a private network namespace. Its only listener
+is a trusted loopback relay at the proxy port. The relay passes accepted
+sockets to Rush over a descriptor channel that the plugin never inherits;
+Rush connects only to that plugin's existing CONNECT proxy. The relay
+holds at most 64 connections, and closes them when the sandbox ends.
+No DNS service, host localhost port or direct route to the internet is
+available inside the namespace. A plugin without `network` gets neither
+the relay nor permission to create internet sockets.
 
 ## Troubleshooting
 

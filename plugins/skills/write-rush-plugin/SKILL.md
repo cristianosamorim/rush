@@ -12,7 +12,7 @@ A rush plugin is a program rush runs **sandboxed** next to the user's agents. It
 - keep **memory** in its data folder;
 - **list, start, follow, message and stop agents** through rush.
 
-It is not a Claude Code plugin. It lives in `~/.config/rush/plugins/<name>/` (or `$RUSH_HOME/plugins/<name>/`), is described by a `plugin.json`, and runs only after the user approves it with `rush plugin approve <name>`. Plugins run on macOS only; elsewhere rush refuses to run them.
+It is not a Claude Code plugin. It lives in `~/.config/rush/plugins/<name>/` (or `$RUSH_HOME/plugins/<name>/`), is described by a `plugin.json`, and runs only after the user approves it with `rush plugin approve <name>`. Plugins run on macOS and Linux when the platform sandbox is available; elsewhere rush refuses to run them.
 
 Read the reference that fits the task before writing code:
 
@@ -30,7 +30,7 @@ Working templates: `templates/rust`, `templates/python`, `templates/node`. A plu
 | Tools of their own, or anything touching agents (list, start, follow, message) | an **rush plugin** (the default protocol): start from a template. |
 | Only prompt text or subagents | Say that a Claude Code plugin or CLAUDE.md may suit better: a rush plugin always runs a program. If they want it in rush anyway, use a template with its tools removed and `"tools": false`. |
 
-Language: Rust gives one binary that needs nothing else in the sandbox, the most robust choice, and the template is built on rush's own plugin crate (`rush-plugin-sdk`, in rush's repository at `plugins/sdk`): the connection on fd 3, the protocol's shapes, `plugin.json` and the check rush makes of a `sidebar.set`. Python and Node work through Homebrew's interpreters (see `references/sandbox.md` for others). Any other language works too: the protocol is length-prefixed JSON-RPC, nothing more.
+Language: Rust gives one binary that needs nothing else in the sandbox, the most robust choice, and the template is built on rush's own plugin crate (`rush-plugin-sdk`, in rush's repository at `plugins/sdk`): the connection on fd 3, the protocol's shapes, `plugin.json` and the check rush makes of a `sidebar.set`. Python and Node work through an absolute interpreter path (see `references/sandbox.md` for runtime paths on each platform). Any other language works too: the protocol is length-prefixed JSON-RPC, nothing more.
 
 ## 2. Ask for as little as possible
 
@@ -70,6 +70,10 @@ rush plugin check <name>
 ```
 
 On Apple Silicon, build for arm64 (`--target aarch64-apple-darwin` if `rustc -vV` says x86_64): an x86_64 program can't start in the sandbox, which blocks Rosetta.
+
+For Python or Node, set `command[0]` to the absolute path printed by
+`command -v python3` or `command -v node` before approval; rush gives the
+plugin a clean `PATH`.
 
 `rush plugin check` validates the manifest, confirms the program exists, and prints exactly what approval would allow. Fix everything it reports. Read its output back to the user: that's what they'll be agreeing to.
 

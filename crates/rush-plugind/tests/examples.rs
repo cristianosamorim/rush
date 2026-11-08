@@ -115,6 +115,42 @@ fn cargo_build(pkg: &str, out: &Path) {
     rush_testenv::copy_executable(&target.join("debug").join(pkg), out).unwrap();
 }
 
+/// Copies a prepared MCP package without using a shell. npm may publish
+/// symlinked files, so retain links rather than following them into a
+/// runner-owned directory.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        let kind = std::fs::symlink_metadata(&src).unwrap().file_type();
+        if kind.is_dir() {
+            copy_tree(&src, &dst);
+        } else if kind.is_symlink() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(&src).unwrap(), &dst).unwrap();
+        } else {
+            std::fs::copy(&src, &dst).unwrap();
+        }
+    }
+}
+
+fn sandbox_is_required() -> bool {
+    (cfg!(target_os = "linux") && std::env::var_os("CI").is_some())
+        || std::env::var_os("RUSH_TEST_REQUIRE_PLUGIN_SANDBOX").is_some()
+        || std::env::var_os("PLUGIN_SANDBOX_REQUIRED").is_some()
+}
+
+fn prepared_memory_plugin() -> Option<PathBuf> {
+    let source = std::env::var_os("MEMORY_PLUGIN_DIR")
+        .or_else(|| std::env::var_os("RUSH_MEMORY_PLUGIN_DIR"))
+        .map(PathBuf::from);
+    if source.is_none() && sandbox_is_required() {
+        panic!("MEMORY_PLUGIN_DIR is required for the Linux memory example test");
+    }
+    source
+}
+
 /// Runs a broker in home until nothing is approved; the broker, once it
 /// listens, and what Run returned, when it does.
 fn run_broker(home: &Home) -> (Broker, mpsc::Receiver<Result<(), String>>) {
@@ -122,9 +158,11 @@ fn run_broker(home: &Home) -> (Broker, mpsc::Receiver<Result<(), String>>) {
         home.path().join("events.jsonl"),
     )));
     let scope = Scope::with_events(logger.clone());
+    let dirs = rush_state::thread_dirs();
     let (ready_tx, ready) = mpsc::channel();
     let (done_tx, done) = mpsc::channel();
     std::thread::spawn(move || {
+        rush_state::set_thread_dirs(dirs);
         let res = rush_plugind::run_with(
             Arc::new(FileHosts::logging_to(logger)),
             Log::discard(),
@@ -409,6 +447,314 @@ fn broker_runs_the_kanban_example() {
     assert!(
         !rush_plugin::sidebar::sidebar_path("kanban").exists(),
         "revoked, its sidebar stayed"
+    );
+}
+
+/// Runs the real reference MCP memory server from its prepared npm package,
+/// then restarts it and reads the graph back from the plugin data folder.
+/// There is no model account involved: all requests are direct MCP calls.
+#[test]
+fn broker_runs_memory_and_persists_the_graph_across_restart() {
+    let Some(source) = prepared_memory_plugin() else {
+        return;
+    };
+    if rush_plugin::supported().is_err() {
+        if sandbox_is_required() {
+            panic!("plugin sandbox required for the memory example");
+        }
+        return;
+    }
+    assert!(
+        source.join("plugin.json").is_file(),
+        "missing memory manifest"
+    );
+    assert!(
+        source
+            .join("node_modules/@modelcontextprotocol/server-memory/dist/index.js")
+            .is_file(),
+        "prepared memory package is missing the server entrypoint"
+    );
+
+    let home = Home::new();
+    let dir = rush_plugin::root().join("memory");
+    copy_tree(&source, &dir);
+    let p = rush_plugin::load(&dir).unwrap_or_else(|e| panic!("memory manifest: {e}"));
+    rush_plugin::approve(&p).unwrap();
+    let (broker, done) = run_broker(&home);
+    broker
+        .wait_status("memory", Duration::from_secs(20), |s| s.state == "running")
+        .unwrap_or_else(|| panic!("memory did not start: {:?}", broker.status()));
+
+    let b = rush_plugin::Broker::new();
+    let init = mcp(
+        &b,
+        "memory",
+        "memory-test",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"rush-memory-test","version":"1"}}}"#,
+    );
+    assert!(init["result"].is_object(), "memory initialize = {init}");
+    let _ = mcp(
+        &b,
+        "memory",
+        "memory-test",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    );
+    let tools = mcp(
+        &b,
+        "memory",
+        "memory-test",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    );
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("memory tools/list = {tools}"))
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for name in ["create_entities", "search_nodes", "read_graph"] {
+        assert!(
+            names.contains(&name),
+            "memory tools/list lacks {name}: {tools}"
+        );
+    }
+
+    let call = |id: u32, name: &str, args: Value| {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": args}
+        });
+        let response = mcp(&b, "memory", "memory-test", &msg.to_string());
+        assert!(response["error"].is_null(), "memory {name} = {response}");
+        assert!(response["result"].is_object(), "memory {name} = {response}");
+        text(&response)
+    };
+    let created = call(
+        3,
+        "create_entities",
+        json!({"entities": [
+            {"name": "RushLinuxMemory", "entityType": "project", "observations": ["survives a broker restart"]},
+            {"name": "LinuxCI", "entityType": "environment", "observations": ["runs the six plugin examples"]}
+        ]}),
+    );
+    assert!(
+        created.contains("RushLinuxMemory"),
+        "create_entities = {created}"
+    );
+    let related = call(
+        4,
+        "create_relations",
+        json!({"relations": [{"from": "RushLinuxMemory", "to": "LinuxCI", "relationType": "validated_by"}]}),
+    );
+    assert!(
+        related.contains("validated_by"),
+        "create_relations = {related}"
+    );
+
+    // The server's configured data path is the plugin's private folder, so a
+    // successful write is also evidence that no real home was used.
+    let memory_file = rush_plugin::data_dir("memory").join("memory.jsonl");
+    wait_file(&memory_file, "RushLinuxMemory");
+
+    let pid = broker
+        .status()
+        .into_iter()
+        .find(|s| s.name == "memory" && s.state == "running")
+        .map(|s| s.pid)
+        .unwrap_or_else(|| panic!("memory had no running pid: {:?}", broker.status()));
+    // SAFETY: this is the memory plugin process started by this test's broker.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    broker
+        .wait_status("memory", Duration::from_secs(20), |s| {
+            s.state == "running" && s.pid != pid && s.restarts >= 1
+        })
+        .unwrap_or_else(|| panic!("memory was not restarted: {:?}", broker.status()));
+
+    let searched = call(5, "search_nodes", json!({"query": "RushLinuxMemory"}));
+    assert!(
+        searched.contains("survives a broker restart"),
+        "search_nodes = {searched}"
+    );
+    let opened = call(6, "open_nodes", json!({"names": ["RushLinuxMemory"]}));
+    assert!(
+        opened.contains("survives a broker restart"),
+        "open_nodes = {opened}"
+    );
+    let graph = call(7, "read_graph", json!({}));
+    assert!(
+        graph.contains("RushLinuxMemory") && graph.contains("validated_by"),
+        "read_graph = {graph}"
+    );
+
+    rush_plugin::revoke("memory").unwrap();
+    rush_plugind::reload().unwrap();
+    done.recv_timeout(Duration::from_secs(10))
+        .expect("broker still running with no approved memory plugin")
+        .unwrap();
+}
+
+/// The Linux broker's memory check must include the MCP server below
+/// bubblewrap, not only bubblewrap's small monitor process.  This fixture is
+/// deliberately dependency-free: the prepared memory plugin supplies the
+/// absolute Node interpreter that the CI installer resolved.
+#[cfg(target_os = "linux")]
+#[test]
+fn broker_enforces_memory_mb_for_descendant_node() {
+    let Some(source) = prepared_memory_plugin() else {
+        return;
+    };
+    if rush_plugin::supported().is_err() {
+        if sandbox_is_required() {
+            panic!("plugin sandbox required for the descendant memory test");
+        }
+        return;
+    }
+
+    let prepared =
+        rush_plugin::load(&source).unwrap_or_else(|e| panic!("prepared memory manifest: {e}"));
+    let node = prepared
+        .command
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("prepared memory manifest has no Node command"));
+
+    let home = Home::new();
+    let dir = rush_plugin::root().join("memory-limit");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("fixture.mjs"),
+        r#"// Keep resident pages alive so the broker measures the descendant.
+globalThis.rushMemoryFixture = Buffer.alloc(64 * 1024 * 1024, 0x5a);
+
+let pending = "";
+function reply(id, result) {
+  process.stdout.write(JSON.stringify({jsonrpc: "2.0", id, result}) + "\n");
+}
+function error(id, message) {
+  process.stdout.write(JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    error: {code: -32601, message}
+  }) + "\n");
+}
+function handle(line) {
+  let request;
+  try {
+    request = JSON.parse(line);
+  } catch (_) {
+    return;
+  }
+  if (request.id === undefined) {
+    return;
+  }
+  switch (request.method) {
+    case "initialize":
+      reply(request.id, {
+        protocolVersion: request.params?.protocolVersion ?? "2025-06-18",
+        capabilities: {tools: {}},
+        serverInfo: {name: "memory-limit", version: "1"}
+      });
+      break;
+    case "tools/list":
+      reply(request.id, {
+        tools: [{
+          name: "memory_fixture",
+          description: "A dependency-free MCP memory-limit fixture.",
+          inputSchema: {type: "object", properties: {}}
+        }]
+      });
+      break;
+    case "tools/call":
+      reply(request.id, {content: [{type: "text", text: "ok"}]});
+      break;
+    default:
+      error(request.id, "no " + request.method);
+  }
+}
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  pending += chunk;
+  let end;
+  while ((end = pending.indexOf("\n")) >= 0) {
+    const line = pending.slice(0, end).trim();
+    pending = pending.slice(end + 1);
+    if (line) {
+      handle(line);
+    }
+  }
+});
+"#,
+    )
+    .unwrap();
+    let manifest = Manifest {
+        name: "memory-limit".into(),
+        protocol: rush_plugin::PROTO_MCP.into(),
+        command: vec![node, "fixture.mjs".into()],
+        memory_mb: 16,
+        ..Default::default()
+    };
+    std::fs::write(
+        dir.join("plugin.json"),
+        rush_state::json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let p = rush_plugin::load(&dir).unwrap();
+    rush_plugin::approve(&p).unwrap();
+    let (broker, done) = run_broker(&home);
+    broker
+        .wait_status("memory-limit", Duration::from_secs(10), |s| {
+            s.state == "running"
+        })
+        .unwrap_or_else(|| panic!("memory fixture did not start: {:?}", broker.status()));
+
+    // Complete the MCP handshake and tools/list before waiting for the
+    // broker's periodic memory check to kill the oversized descendant.
+    let b = rush_plugin::Broker::new();
+    let init = mcp(
+        &b,
+        "memory-limit",
+        "memory-limit-test",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"rush-memory-limit-test","version":"1"}}}"#,
+    );
+    assert!(
+        init["result"].is_object(),
+        "memory-limit initialize = {init}"
+    );
+    let _ = mcp(
+        &b,
+        "memory-limit",
+        "memory-limit-test",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    );
+    let tools = mcp(
+        &b,
+        "memory-limit",
+        "memory-limit-test",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    );
+    assert_eq!(
+        tools["result"]["tools"][0]["name"], "memory_fixture",
+        "memory-limit tools/list = {tools}"
+    );
+
+    let exceeded = broker.wait_status("memory-limit", Duration::from_secs(20), |s| {
+        s.error.contains("over its 16 MB limit")
+    });
+
+    // Revoke even when the monitor's assertion fails, so the broker thread
+    // cannot leak into the next integration test.
+    rush_plugin::revoke("memory-limit").unwrap();
+    rush_plugind::reload().unwrap();
+    done.recv_timeout(Duration::from_secs(10))
+        .expect("broker still running with no approved memory-limit plugin")
+        .unwrap();
+    assert!(
+        exceeded.is_some(),
+        "descendant Node allocation did not exceed its limit: {:?}",
+        broker.status()
     );
 }
 

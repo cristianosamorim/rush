@@ -4,7 +4,7 @@ A plugin adds to every rush-mode session: tools Claude can call, subagents, text
 
 Every plugin runs sandboxed and does only what you approved. It can't read your files, reach the internet (except hosts it named and you approved), start programs, or take over your agents.
 
-Plugins you install run on macOS only for now. Elsewhere rush won't run them rather than run them unsandboxed. [Bundled plugins](#bundled-plugins) run everywhere.
+Plugins you install run sandboxed on macOS and Linux (Ubuntu 24.04 in CI). Linux needs bubblewrap, user namespaces and seccomp; when that backend is unavailable, rush refuses to start installed plugins rather than running them unsandboxed. [Bundled plugins](#bundled-plugins) run everywhere.
 
 | | |
 |---|---|
@@ -167,7 +167,7 @@ Every method and event: [protocol](skills/write-rush-plugin/references/protocol.
 
 ## Examples
 
-The examples are Rust, built on [`rush-plugin-sdk`](sdk) (`plugins/sdk`): rush's crate for writing plugins, with the connection on fd 3, the protocol's shapes, `plugin.json` and the check rush makes of a `sidebar.set`. It needs nothing of rush's own crates. The examples and the crate are in rush's Cargo workspace, so CI formats, lints and tests them with the rest, and rush's own tests run `neighbours`, `reconnect`, `delegate` and `kanban` in the real sandbox. Build them from the top of rush's repository. On Apple Silicon, build for arm64 (`--target aarch64-apple-darwin` if `rustc -vV` says x86_64): an x86_64 plugin can't start in the sandbox, which blocks Rosetta.
+The examples are Rust, built on [`rush-plugin-sdk`](sdk) (`plugins/sdk`): rush's crate for writing plugins, with the connection on fd 3, the protocol's shapes, `plugin.json` and the check rush makes of a `sidebar.set`. It needs nothing of rush's own crates. The examples and the crate are in rush's Cargo workspace, so CI formats, lints and tests them with the rest, and rush's tests exercise all six examples (`neighbours`, `kanban`, `delegate`, `memory`, `autodrafts` and `reconnect`) in the real sandbox. Build them from the top of rush's repository. On Apple Silicon, build for arm64 (`--target aarch64-apple-darwin` if `rustc -vV` says x86_64): an x86_64 plugin can't start in the sandbox, which blocks Rosetta.
 
 - [`neighbours`](examples/neighbours) is the smallest useful plugin, and the one to read first: one tool that tells Claude which other agents are working in the same repository, and on which branch, so it doesn't trip over them. About 100 lines of Rust, with only the `list` capability.
 
@@ -202,12 +202,10 @@ The examples are Rust, built on [`rush-plugin-sdk`](sdk) (`plugins/sdk`): rush's
   rush plugin approve delegate
   ```
 
-- [`memory`](examples/memory) is the reference MCP memory server, `@modelcontextprotocol/server-memory`, run unchanged: a knowledge graph Claude keeps across sessions, stored in the plugin's data folder.
+- [`memory`](examples/memory) is the reference MCP memory server, `@modelcontextprotocol/server-memory`, run unchanged: a knowledge graph Claude keeps across sessions, stored in the plugin's data folder. It needs Node.js 24 or newer. Its installer resolves an absolute `node` path and pins the current server release (`2.1.0`), so the clean plugin environment does not depend on a host `PATH`.
 
   ```sh
-  mkdir -p ~/.config/rush/plugins/memory && cd ~/.config/rush/plugins/memory
-  npm install @modelcontextprotocol/server-memory
-  cp <rush>/plugins/examples/memory/plugin.json .
+  bash <rush>/plugins/examples/memory/install.sh ~/.config/rush/plugins/memory
   rush plugin approve memory
   ```
 

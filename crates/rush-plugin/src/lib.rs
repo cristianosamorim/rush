@@ -5,7 +5,7 @@
 //!
 //! A plugin is a folder in root() with a plugin.json manifest and a
 //! program. It runs in its own process, started by the broker (`rush
-//! plugind`), in a macOS sandbox that denies everything it wasn't given:
+//! plugind`), in a platform sandbox that denies everything it wasn't given:
 //! it reads its own folder and the system's libraries, writes only its
 //! data folder, starts no other programs, and reaches the network only
 //! through rush's proxy, to the hosts its manifest names. It runs at

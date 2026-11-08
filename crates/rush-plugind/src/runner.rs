@@ -296,10 +296,12 @@ impl Runner {
     }
 
     /// Starts the plugin and starts it again whenever it ends, until it is
-    /// shut down or refused. Only starting and restarting take a thread:
+    /// shut down or refused. On macOS only starting and restarting take a thread:
     /// while it runs, nothing waits on one for it (Rust-only; Go has a
     /// goroutine each): its end, the end of its connection or the broker's
-    /// stop starts what comes next on a fresh one.
+    /// stop starts what comes next on a fresh one. Linux external plugins
+    /// retain their spawning thread until exit: bubblewrap's parent-death
+    /// signal is tied to that thread, not just the broker process.
     pub(crate) fn supervise(self: Arc<Self>) {
         self.supervise_from(Duration::from_secs(1), None);
     }
@@ -363,9 +365,17 @@ impl Runner {
                 }
             };
             let began = Instant::now();
+            #[cfg(target_os = "linux")]
+            let keep_spawn_thread = !p.bundled;
             match self.launch(p) {
                 Ok(run) => {
+                    #[cfg(target_os = "linux")]
+                    let exited = keep_spawn_thread.then(|| run.exited.clone());
                     self.hand_off(run, began, backoff);
+                    #[cfg(target_os = "linux")]
+                    if let Some(exited) = exited {
+                        exited.wait();
+                    }
                     return;
                 }
                 Err(e) => ended = Some((began, Err(e))),
@@ -457,6 +467,10 @@ impl Runner {
             }
         };
 
+        // Launch's pre_exec closures own reserved descriptor sources.
+        // Release the parent's copies before waiting for initialize, so
+        // an early sandbox failure is observed as EOF immediately.
+        drop(cmd);
         let pid = child.id() as i32;
         let (exited, wait_err) = wait_for(child);
         self.started(
