@@ -453,7 +453,7 @@ fn sandbox_holds() {
 
 static void mark(const char *path, const char *message, size_t length) {
     if (path == NULL) return;
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd >= 0) {
         (void)write(fd, message, length);
         (void)close(fd);
@@ -621,6 +621,25 @@ fn sandbox_preserves_approved_aliases_and_write_overlaps() {
         assert_eq!(got[key], "allowed", "{key}: {got:?}");
     }
     assert_eq!(got["home"], data.to_string_lossy());
+    let canonical_data = data.canonicalize().unwrap();
+    let got: std::collections::BTreeMap<String, String> = conn
+        .call(
+            &ctx,
+            "probe",
+            &json!({
+                "secret": alias_dir.join("plugin.json"), "outside": writable.join("planted"),
+                "sock": home.path().join("absent.sock"), "data": canonical_data, "proxy": 0
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        got["read secret"], "allowed",
+        "plugin alias isn't readable: {got:?}"
+    );
+    assert_eq!(
+        got["write data"], "allowed",
+        "canonical data was hidden by a read ancestor: {got:?}"
+    );
     stop(child, conn);
 
     // Broad grants cannot replace the private root or introduce host procfs.

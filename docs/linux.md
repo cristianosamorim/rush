@@ -146,6 +146,18 @@ installed in Linux. `kanban` also needs kanban-code's files and CLI at
 the paths named in its manifest. A host tool requested through the
 approved `exec` capability runs through Rush's broker.
 
+For `kanban`, run the upstream `kanban-code-server` on Linux and install
+its CLI. The upstream CLI revision checked by this fork still detects
+only the macOS app when `kanban relink` runs. The Linux download includes
+`plugins/kanban/linux/patch-cli.mjs` and its README to correct that
+detection before rebuilding the CLI. The correction recognizes the
+current user's Linux server process and retains the server's mailbox
+acknowledgment; it does not pretend a stopped server is running. Follow
+[the compatibility instructions](https://github.com/cristianosamorim/rush/blob/codex/linux-port/plugins/examples/kanban/linux/README.md).
+This does not install the upstream server or configure coding-agent
+accounts. CI tests the real patched CLI against a controlled mailbox
+fixture; a production Kanban deployment remains a separate integration.
+
 The Linux sandbox exposes the plugin folder and libraries read-only,
 its data and approved write paths read-write, and a private `/proc`.
 Only its approved initial program can execute. Threads and connected

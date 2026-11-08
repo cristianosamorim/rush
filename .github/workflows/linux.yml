@@ -44,7 +44,7 @@ jobs:
           node-version: 24
       - name: Prepare the memory example
         env:
-          MEMORY_PLUGIN_DIR: ${{ runner.temp }}/rush-memory-plugin
+          MEMORY_PLUGIN_DIR: ${{ runner.temp }}/rush-plugins/memory
         run: |
           bash plugins/examples/memory/install.sh "$MEMORY_PLUGIN_DIR"
           echo "MEMORY_PLUGIN_DIR=$MEMORY_PLUGIN_DIR" >> "$GITHUB_ENV"
@@ -82,6 +82,10 @@ jobs:
           target/release/rush --help
           RUSH_HOME="$RUNNER_TEMP/rush-smoke" timeout 30s target/release/rush --render 120x40 > "$RUNNER_TEMP/rush-screen.txt"
           test -s "$RUNNER_TEMP/rush-screen.txt"
+          plugin_home="$RUNNER_TEMP/rush-plugin-smoke"
+          mkdir -p "$plugin_home/plugins/neighbours"
+          cp target/release/neighbours plugins/examples/neighbours/plugin.json "$plugin_home/plugins/neighbours/"
+          RUSH_HOME="$plugin_home" timeout 30s target/release/rush plugin check neighbours
       - name: Package
         run: |
           mkdir -p dist/docs
@@ -93,6 +97,7 @@ jobs:
           done
           mkdir -p dist/plugins/memory
           cp plugins/examples/memory/install.sh plugins/examples/memory/plugin.json dist/plugins/memory/
+          cp -R plugins/examples/kanban/linux dist/plugins/kanban/
           tar -czf rush-linux-x86_64.tar.gz -C dist rush LICENSE README.md docs/linux.md plugins
           sha256sum rush-linux-x86_64.tar.gz > rush-linux-x86_64.tar.gz.sha256
       - uses: actions/upload-artifact@v4
@@ -103,3 +108,26 @@ jobs:
             rush-linux-x86_64.tar.gz.sha256
           retention-days: 14
           if-no-files-found: error
+
+  kanban-cli:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/checkout@v4
+        with:
+          repository: langwatch/kanban-code
+          ref: 2a0a0fcca154a3dbba5ef972fc3ac50da1acadf4
+          path: work/kanban-code
+          persist-credentials: false
+      - name: Patch Linux server detection
+        run: node plugins/examples/kanban/linux/patch-cli.mjs work/kanban-code
+      - name: Build the real Kanban CLI
+        run: |
+          npx --yes pnpm@10.30.3 --dir work/kanban-code/cli install --frozen-lockfile --ignore-scripts
+          npx --yes pnpm@10.30.3 --dir work/kanban-code/cli build
+      - name: Test Linux relink compatibility
+        run: node plugins/examples/kanban/linux/test-cli.mjs work/kanban-code "$(command -v node)"
