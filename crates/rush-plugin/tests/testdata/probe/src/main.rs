@@ -55,7 +55,7 @@ fn probe(p: &Value) -> BTreeMap<&'static str, String> {
         // that its approved-host checks remain in force.
         let response = (|| -> std::io::Result<()> {
             use std::io::{Read, Write};
-            let mut c = TcpStream::connect(([127, 0, 0, 1], port as u16))?;
+            let mut c = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port as u16))?;
             c.set_read_timeout(Some(Duration::from_secs(3)))?;
             c.set_write_timeout(Some(Duration::from_secs(3)))?;
             c.write_all(

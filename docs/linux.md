@@ -39,7 +39,8 @@ continues to use the upstream tap.
 The [Linux workflow](https://github.com/cristianosamorim/rush/actions/workflows/linux.yml)
 builds the executable after formatting, Clippy and workspace tests pass.
 Each successful run publishes a `rush-linux-x86_64` artifact. These
-artifacts are temporary CI builds, not a stable Linux release.
+artifacts include Rush, the five compiled Rust example plugins, and the
+memory plugin installer. They are temporary CI builds, not a stable release.
 
 Download the artifact from a successful run while signed in to GitHub,
 then unzip it. In the extracted folder, verify and install the binary:
@@ -123,7 +124,21 @@ rush plugin approve neighbours
 rush plugin list
 ```
 
-Install each example first, following [the examples guide](../plugins/README.md#examples).
+Install each example first, following [the examples guide](https://github.com/cristianosamorim/rush/blob/codex/linux-port/plugins/README.md#examples).
+From the extracted Linux download, install the compiled examples with:
+
+```sh
+mkdir -p "$HOME/.config/rush/plugins"
+for plugin in neighbours kanban delegate autodrafts reconnect; do
+  cp -R "plugins/$plugin" "$HOME/.config/rush/plugins/"
+done
+sh plugins/memory/install.sh "$HOME/.config/rush/plugins/memory"
+```
+
+Then review and approve each plugin by name. `autodrafts` and `reconnect`
+are examples of features also supplied by Rush's bundled plugins; choose
+which implementation to enable when configuring your own sessions.
+
 The Rust examples are `neighbours`, `kanban`, `delegate`, `autodrafts`
 and `reconnect`. The `memory` installer selects an absolute Node path
 and installs the reference MCP memory server; Node and npm must be

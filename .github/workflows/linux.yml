@@ -75,7 +75,7 @@ jobs:
             --skip stuck_shell_is_stopped \
             --skip compacts_only_the_conversation_expected
       - name: Build
-        run: cargo build --release --locked -p rush
+        run: cargo build --release --locked -p rush -p neighbours -p kanban -p delegate -p autodrafts -p reconnect
       - name: Smoke test
         run: |
           target/release/rush --version
@@ -87,7 +87,13 @@ jobs:
           mkdir -p dist/docs
           cp target/release/rush LICENSE README.md dist/
           cp docs/linux.md dist/docs/
-          tar -czf rush-linux-x86_64.tar.gz -C dist rush LICENSE README.md docs/linux.md
+          for plugin in neighbours kanban delegate autodrafts reconnect; do
+            mkdir -p "dist/plugins/$plugin"
+            cp "target/release/$plugin" "plugins/examples/$plugin/plugin.json" "dist/plugins/$plugin/"
+          done
+          mkdir -p dist/plugins/memory
+          cp plugins/examples/memory/install.sh plugins/examples/memory/plugin.json dist/plugins/memory/
+          tar -czf rush-linux-x86_64.tar.gz -C dist rush LICENSE README.md docs/linux.md plugins
           sha256sum rush-linux-x86_64.tar.gz > rush-linux-x86_64.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:

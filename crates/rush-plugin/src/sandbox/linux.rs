@@ -599,7 +599,7 @@ fn validate_mount_source(path: &str) -> Result<(), String> {
                 io::Error::last_os_error()
             ));
         }
-        stats.f_type as i64
+        stats.f_type
     };
     const PROC_SUPER_MAGIC: i64 = 0x9fa0;
     if fs_type == PROC_SUPER_MAGIC || (metadata.is_dir() && procfs_mount_below(path)?) {
@@ -821,7 +821,7 @@ extern "C" fn trusted_bootstrap_init(
 
 fn ctor_exit(prefix: &str, error: &dyn std::fmt::Display, status: libc::c_int) -> ! {
     let mut message = String::new();
-    let _ = write!(&mut message, "{prefix}: {error}\n");
+    let _ = writeln!(&mut message, "{prefix}: {error}");
     let bytes = message.as_bytes();
     // SAFETY: fd 2 is the bootstrap's inherited stderr and the pointer/length
     // refer to a live immutable byte slice.

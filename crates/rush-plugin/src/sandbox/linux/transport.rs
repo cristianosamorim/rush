@@ -133,8 +133,12 @@ pub(super) fn channel(proxy_port: u16) -> io::Result<OwnedFd> {
         .stack_size(256 << 10)
         .spawn(move || {
             let result = (|| {
-                let Some((LISTENER, listener)) = recv_fd(host.as_raw_fd())? else {
-                    return Err(io::Error::other("sandbox didn't send its exec listener"));
+                let listener = match recv_fd(host.as_raw_fd())? {
+                    Some((LISTENER, listener)) => listener,
+                    // The caller can abandon an unspawned Command after a
+                    // later validation error; this is ordinary cancellation.
+                    None => return Ok(()),
+                    Some(_) => return Err(io::Error::other("unexpected sandbox listener message")),
                 };
                 super::seccomp::first_exec(listener)?;
                 if proxy_port != 0 {
@@ -236,7 +240,7 @@ pub(super) fn start_bridge(control: RawFd, proxy_port: u16) -> io::Result<()> {
         return Ok(());
     }
     let listener = TcpListener::from(high_fd(
-        TcpListener::bind(([127, 0, 0, 1], proxy_port))?.into(),
+        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, proxy_port))?.into(),
     )?);
     let mut ready = [-1; 2];
     // SAFETY: bootstrap is single-threaded; pipe2 initializes both fds.
@@ -349,9 +353,9 @@ mod tests {
 
     #[test]
     fn relay_bounds_connections_and_shutdown_closes_every_tunnel() {
-        let outer = TcpListener::bind(([127, 0, 0, 1], 0)).unwrap();
+        let outer = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = outer.local_addr().unwrap().port();
-        let inner = TcpListener::bind(([127, 0, 0, 1], 0)).unwrap();
+        let inner = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let (host, child) = pair().unwrap();
         let worker = std::thread::spawn(move || {
             let all = Arc::new(Connections::default());

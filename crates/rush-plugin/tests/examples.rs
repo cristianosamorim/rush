@@ -445,22 +445,28 @@ fn sandbox_holds() {
         let library = dir.join("preload.so");
         std::fs::write(
             &source,
-            r#"#include <fcntl.h>
+            r#"#include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
-static void mark(const char *path) {
+static void mark(const char *path, const char *message, size_t length) {
     if (path == NULL) return;
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) {
-        (void)write(fd, "loaded\n", 7);
+        (void)write(fd, message, length);
         (void)close(fd);
     }
 }
 
 __attribute__((constructor)) static void rush_preload(void) {
-    mark(getenv("RUSH_PRELOAD_ALLOWED"));
-    mark(getenv("RUSH_PRELOAD_OUTSIDE"));
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int filtered = fd == -1 && errno == EPERM;
+    if (fd >= 0) close(fd);
+    const char *message = filtered ? "filtered\n" : "unfiltered\n";
+    mark(getenv("RUSH_PRELOAD_ALLOWED"), message, filtered ? 9 : 11);
+    mark(getenv("RUSH_PRELOAD_OUTSIDE"), message, filtered ? 9 : 11);
 }
 "#,
         )
@@ -513,7 +519,11 @@ __attribute__((constructor)) static void rush_preload(void) {
     #[cfg(target_os = "linux")]
     {
         let marker = data.join("preload-loaded");
-        wait_for_file(&marker, |s| s == "loaded\n");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "filtered\n",
+            "untrusted preload code ran before seccomp"
+        );
         assert!(
             !outside_preload.exists(),
             "loader env escaped the sandbox: {}",
@@ -559,4 +569,77 @@ __attribute__((constructor)) static void rush_preload(void) {
     assert_eq!(got["home"], data.display().to_string());
     stop(child, conn);
     proxy.close();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_preserves_approved_aliases_and_write_overlaps() {
+    if let Err(e) = rush_plugin::supported() {
+        assert!(!sandbox_is_required(), "plugin sandbox required: {e}");
+        return;
+    }
+    let home = Home::new();
+    let dir = rush_plugin::root().join("probe");
+    std::fs::create_dir_all(&dir).unwrap();
+    cargo_build("rush-plugin-probe", "probe", &dir.join("probe"));
+    let writable = home.path().join("approved-write");
+    std::fs::create_dir(&writable).unwrap();
+    let readable = home.path().join("approved-read");
+    std::fs::write(&readable, "approved content").unwrap();
+    let mut manifest = json!({
+        "name": "probe", "command": ["probe"],
+        "read": [home.path(), writable], "write": [writable]
+    });
+    let write_manifest = |m: &Value| {
+        std::fs::write(
+            dir.join("plugin.json"),
+            rush_state::json::to_vec(m).unwrap(),
+        )
+        .unwrap();
+    };
+    write_manifest(&manifest);
+    // Both the plugin path and data environment retain the symlink spelling.
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("rush-home");
+    std::os::unix::fs::symlink(home.path(), &alias).unwrap();
+    rush_state::set_thread_dir(Some(alias));
+    let alias_dir = rush_plugin::root().join("probe");
+    let data = rush_plugin::data_dir("probe");
+    let (child, conn) = start(&alias_dir, 0, Arc::new(|_, _, m, _| Err(no_method(m))));
+    let ctx = Ctx::background().with_timeout(Duration::from_secs(20));
+    let got: std::collections::BTreeMap<String, String> = conn
+        .call(
+            &ctx,
+            "probe",
+            &json!({
+                "secret": readable, "outside": writable.join("planted"),
+                "sock": home.path().join("absent.sock"), "data": data, "proxy": 0
+            }),
+        )
+        .unwrap();
+    for key in ["read secret", "write outside", "write data"] {
+        assert_eq!(got[key], "allowed", "{key}: {got:?}");
+    }
+    assert_eq!(got["home"], data.to_string_lossy());
+    stop(child, conn);
+
+    // Broad grants cannot replace the private root or introduce host procfs.
+    for rejected in [PathBuf::from("/"), {
+        let p = home.path().join("host-proc");
+        std::os::unix::fs::symlink("/proc", &p).unwrap();
+        p
+    }] {
+        manifest["read"] = json!([rejected]);
+        write_manifest(&manifest);
+        let error = Launch {
+            plugin: load(&alias_dir).unwrap(),
+            proxy_port: 0,
+        }
+        .command()
+        .unwrap_err();
+        assert!(
+            error.contains("host root") || error.contains("procfs"),
+            "{error}"
+        );
+    }
 }
